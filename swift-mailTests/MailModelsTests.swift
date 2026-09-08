@@ -4,6 +4,26 @@ import Testing
 
 struct MailModelsTests {
 
+    /// The reader decides "is this a draft?" from the message, not from the
+    /// selected mailbox: the sidebar writes the new mailbox id a render before
+    /// the reload clears the old selection, and a mailbox-derived answer opened
+    /// a compose window pre-filled with whatever was previously on screen.
+    @Test("Draft-ness comes from the message's own keyword")
+    func draftKeywordIdentifiesDrafts() throws {
+        let draft = try decodeEmailDetail("""
+        { "id": "D1", "keywords": { "$draft": true, "$seen": true } }
+        """)
+        #expect(draft.isDraft)
+
+        let archived = try decodeEmailDetail("""
+        { "id": "A1", "keywords": { "$seen": true } }
+        """)
+        #expect(!archived.isDraft)
+
+        // No keywords at all is not a draft either.
+        #expect(try !decodeEmailDetail("{ \"id\": \"A2\" }").isDraft)
+    }
+
     @Test("Attachment names are reduced to one safe path component")
     func attachmentFileNames() {
         func name(_ raw: String?) -> String {

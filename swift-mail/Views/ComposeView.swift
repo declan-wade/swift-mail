@@ -40,6 +40,9 @@ struct ComposeView: View {
     /// which is far too heavy to redo on every keystroke while typing next to
     /// it in split view.
     @State private var debouncedMarkdown: String
+    /// The draft as last opened, sent or saved. Closing compares against this
+    /// so only genuine unsaved edits raise the prompt.
+    @State private var savedDraft: ComposeDraft
     @State private var isSending = false
     @State private var isSaving = false
     @State private var isConfirmingEmptySubject = false
@@ -54,6 +57,11 @@ struct ComposeView: View {
         self.store = store
         _draft = State(initialValue: draft)
         _debouncedMarkdown = State(initialValue: draft.markdown)
+        _savedDraft = State(initialValue: draft)
+    }
+
+    private var hasUnsavedChanges: Bool {
+        draft.hasChanges(from: savedDraft)
     }
 
     var body: some View {
@@ -140,6 +148,26 @@ struct ComposeView: View {
             if draft.identityID == nil {
                 draft.identityID = store.defaultIdentity?.id
             }
+        }
+        // Native window-close interception (macOS 15+), so ⌘W, the red button
+        // and Quit all route through the same prompt without an
+        // `NSWindowDelegate` bridge.
+        .dismissalConfirmationDialog(
+            "Save this message as a draft?",
+            shouldPresent: hasUnsavedChanges
+        ) {
+            Button("Save Draft") {
+                // Unstructured on purpose: this outlives the window being torn
+                // down, and a failure is reported through the store so it still
+                // surfaces once this window is gone.
+                Task { await saveOnClose() }
+            }
+
+            Button("Discard", role: .destructive) {}
+
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Closing without saving will discard your changes.")
         }
         .confirmationDialog(
             "Send without a subject?",
@@ -346,10 +374,28 @@ struct ComposeView: View {
 
         do {
             try await store.send(draft)
+            // The message is gone; there is nothing left unsaved, and without
+            // this the close below would raise the save-draft prompt on a
+            // message that has just been sent.
+            savedDraft = draft
             dismiss()
         } catch {
             statusMessage = nil
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Saving as the window closes. The compose window's own error alert dies
+    /// with it, so a failure here has to be reported somewhere that outlives
+    /// it — otherwise the draft vanishes silently, which is the one outcome
+    /// this prompt exists to prevent.
+    private func saveOnClose() async {
+        commitPendingEdits()
+
+        do {
+            try await store.saveDraft(draft)
+        } catch {
+            store.errorMessage = "The draft could not be saved: \(error.localizedDescription)"
         }
     }
 
@@ -362,6 +408,7 @@ struct ComposeView: View {
 
         do {
             try await store.saveDraft(draft)
+            savedDraft = draft
             statusMessage = "Saved to Drafts"
         } catch {
             statusMessage = nil

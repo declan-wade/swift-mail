@@ -426,6 +426,16 @@ nonisolated struct EmailDetail: Identifiable, Hashable, Decodable {
         (attachments ?? []).filter { !$0.isInline }
     }
 
+    /// Whether this message is an unsent draft.
+    ///
+    /// Read from the message's own keyword rather than from whichever mailbox
+    /// happens to be selected: the sidebar writes the new mailbox id a render
+    /// before the reload clears the old selection, so a mailbox-derived answer
+    /// is briefly wrong about the message still on screen.
+    var isDraft: Bool {
+        keywords?["$draft"] == true
+    }
+
     var subjectLine: String {
         subject?.nilIfEmpty ?? "No Subject"
     }

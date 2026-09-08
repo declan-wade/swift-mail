@@ -83,6 +83,9 @@ final class MailStore: ObservableObject {
     /// The mailbox the messages currently on screen were fetched for, which is
     /// not the same as the selected one while a switch is in flight.
     private var loadedMailboxID: Mailbox.ID?
+    /// The message whose body is being fetched right now, so the same fetch
+    /// isn't started twice concurrently.
+    private var loadingDetailEmailID: EmailPreview.ID?
     /// The last-seen server state per JMAP type, so background syncs ask the
     /// server only for what changed (`Email/changes`) instead of re-querying.
     private var emailState: String?
@@ -395,6 +398,16 @@ final class MailStore: ObservableObject {
 
     /// Debounced entry point for the search field.
     func searchQueryChanged(_ text: String) {
+        // SwiftUI writes the current value straight back through a `searchable`
+        // binding when the field is focused and again when it is dismissed.
+        // Without this guard each of those no-op writes scheduled a full
+        // mailbox reload, which cleared the list selection and re-fetched the
+        // open message — and swallowed the first Escape, so the field appeared
+        // to need dismissing twice.
+        guard text != searchText else {
+            return
+        }
+
         searchText = text
         searchTask?.cancel()
 
@@ -421,9 +434,21 @@ final class MailStore: ObservableObject {
     }
 
     func loadEmailDetail(emailID: EmailPreview.ID) async {
+        // Assigning `selectedEmailID` below trips the list's `onChange`, which
+        // asks for the very fetch this call just started — two round trips for
+        // one message on every load. Collapsing them needs an *in-flight*
+        // guard rather than an "already loaded" one: the reader's Try Again
+        // re-requests a message that failed, and that has to get through.
+        guard loadingDetailEmailID != emailID else {
+            return
+        }
+
         guard let client = makeClient(), let session, let accountID else {
             return
         }
+
+        loadingDetailEmailID = emailID
+        defer { loadingDetailEmailID = nil }
 
         selectedEmailID = emailID
         isLoadingSelectedEmail = true

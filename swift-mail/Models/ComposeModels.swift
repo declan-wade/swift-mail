@@ -103,6 +103,21 @@ nonisolated struct ComposeDraft: Identifiable, Hashable, Codable {
     var windowTitle: String {
         subject.nilIfEmpty ?? "New Message"
     }
+
+    /// Whether anything the user would mind losing differs from `original`.
+    ///
+    /// `identityID` is deliberately excluded: the compose window fills it in
+    /// from the default identity just after opening, and treating that as an
+    /// edit would prompt on closing a window nobody typed in. `id`, `mode` and
+    /// the threading headers are seeded, never edited.
+    func hasChanges(from original: ComposeDraft) -> Bool {
+        to != original.to
+            || cc != original.cc
+            || bcc != original.bcc
+            || subject != original.subject
+            || markdown != original.markdown
+            || attachments != original.attachments
+    }
 }
 
 // MARK: - Seeding drafts

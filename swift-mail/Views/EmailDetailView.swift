@@ -63,7 +63,7 @@ struct EmailDetailView: View {
                     }
                 }
             }
-        } else if store.selectedMailbox?.role == "drafts", let email = store.selectedEmail {
+        } else if let email = store.selectedEmail, email.isDraft {
             DraftPlaceholder(email: email, store: store)
         } else if let email = store.selectedEmail {
             reader(for: email)
