@@ -647,22 +647,61 @@ final class JMAPClient {
             ]
         ]
 
-        guard !draft.attachments.isEmpty else {
-            return alternative
-        }
+        // Inline parts belong *inside* a `multipart/related` with the body that
+        // references them, not beside it in the mixed part — that relationship
+        // is what lets a recipient's client resolve `cid:` back to the image.
+        let inline = draft.attachments.filter(\.isInline)
+        let body: [String: Any] = inline.isEmpty ? alternative : [
+            "type": "multipart/related",
+            "subParts": [alternative] + inline.map { attachment in
+                var part = part(for: attachment, disposition: "inline")
+                part["cid"] = attachment.contentID
+                return part
+            }
+        ]
 
-        let parts: [[String: Any]] = draft.attachments.map { attachment in
-            [
-                "blobId": attachment.blobId,
-                "type": attachment.type,
-                "name": attachment.name,
-                "disposition": "attachment"
-            ]
+        let files = draft.listedAttachments
+        guard !files.isEmpty else {
+            return body
         }
 
         return [
             "type": "multipart/mixed",
-            "subParts": [alternative] + parts
+            "subParts": [body] + files.map { part(for: $0, disposition: "attachment") }
+        ]
+    }
+
+    /// The user's Markdown, rendered, with the forwarded message's own HTML
+    /// appended untouched when this is an HTML forward.
+    private static func htmlBody(for draft: ComposeDraft) -> String {
+        let authored = MarkdownRenderer.htmlDocument(from: draft.markdown)
+
+        guard let forwarded = draft.forwardedHTML else {
+            return authored
+        }
+
+        return authored + forwarded
+    }
+
+    /// The plain-text alternative. A preserved HTML forward has no faithful
+    /// text equivalent, so the original is flattened for it rather than
+    /// shipping a text part that silently omits the forwarded message.
+    private static func plainTextBody(for draft: ComposeDraft) -> String {
+        let authored = MarkdownRenderer.plainText(from: draft.markdown)
+
+        guard let forwarded = draft.forwardedHTML else {
+            return authored
+        }
+
+        return authored + "\n\n" + forwarded.htmlStripped()
+    }
+
+    private static func part(for attachment: ComposeAttachment, disposition: String) -> [String: Any] {
+        [
+            "blobId": attachment.blobId,
+            "type": attachment.type,
+            "name": attachment.name,
+            "disposition": disposition
         ]
     }
 
@@ -679,8 +718,8 @@ final class JMAPClient {
             "subject": draft.subject,
             "bodyStructure": bodyStructure(for: draft),
             "bodyValues": [
-                "text": ["value": MarkdownRenderer.plainText(from: draft.markdown)],
-                "html": ["value": MarkdownRenderer.htmlDocument(from: draft.markdown)]
+                "text": ["value": plainTextBody(for: draft)],
+                "html": ["value": htmlBody(for: draft)]
             ]
         ]
 

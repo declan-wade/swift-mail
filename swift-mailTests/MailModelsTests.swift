@@ -151,6 +151,44 @@ struct MailModelsTests {
         #expect(local.htmlBodyLoadsRemoteContent == false)
     }
 
+    /// The reader entity-decodes the body before handing it to the web view, so
+    /// the detector has to look at the same decoded text. A real message with 70
+    /// images and 330 `&quot;` entities was reported as having no remote content
+    /// — images blocked, no banner to unblock them.
+    @Test("Entity-encoded attribute quotes still count as remote content")
+    func entityEncodedRemoteContent() throws {
+        let encoded = try decodeEmailDetail("""
+        {
+            "id": "E4",
+            "htmlBody": [{ "partId": "1", "type": "text/html" }],
+            "bodyValues": { "1": { "value": "<img src=&quot;https://tracker.example/pixel.gif&quot;>" } }
+        }
+        """)
+
+        #expect(encoded.htmlBodyLoadsRemoteContent == true)
+    }
+
+    /// The web view resolves these to https, where the content blocker stops
+    /// them, so the banner has to be offered for them too.
+    @Test("Protocol-relative URLs count as remote content")
+    func protocolRelativeRemoteContent() throws {
+        func detail(_ body: String) throws -> EmailDetail {
+            try decodeEmailDetail("""
+            {
+                "id": "E5",
+                "htmlBody": [{ "partId": "1", "type": "text/html" }],
+                "bodyValues": { "1": { "value": "\(body)" } }
+            }
+            """)
+        }
+
+        #expect(try detail("<img src=\\\"//cdn.example/a.png\\\">").htmlBodyLoadsRemoteContent)
+        #expect(try detail("<div style=\\\"background:url(//cdn.example/b.png)\\\">").htmlBodyLoadsRemoteContent)
+        // Root-relative and inline data stay local.
+        #expect(try !detail("<img src=\\\"/local/a.png\\\">").htmlBodyLoadsRemoteContent)
+        #expect(try !detail("<img src=\\\"data:image/png;base64,AAAA\\\">").htmlBodyLoadsRemoteContent)
+    }
+
     @Test("editDraft seeds recipients, subject and body from the source draft")
     func editDraftSeeding() throws {
         let email = try decodeEmailDetail("""

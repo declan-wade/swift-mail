@@ -89,7 +89,11 @@ struct EmailDetailView: View {
 
             Divider()
 
-            HTMLMessageView(html: email.htmlDocument, blocksRemoteContent: !loadsRemote)
+            HTMLMessageView(
+                html: email.htmlDocument,
+                inlineImageResolver: { cid in await store.inlineImage(cid: cid, in: email) },
+                blocksRemoteContent: !loadsRemote
+            )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .id(email.id)
         }

@@ -450,6 +450,10 @@ final class MailStore: ObservableObject {
         loadingDetailEmailID = emailID
         defer { loadingDetailEmailID = nil }
 
+        if selectedEmail?.id != emailID {
+            inlineImageCache.removeAll()
+        }
+
         selectedEmailID = emailID
         isLoadingSelectedEmail = true
         detailErrorMessage = nil
@@ -687,6 +691,77 @@ final class MailStore: ObservableObject {
         }
 
         return moved
+    }
+
+    // MARK: - Inline images
+
+    /// Bytes already fetched for the open message, keyed by blob id. Cleared
+    /// when a different message is opened, which is what bounds it.
+    /// ponytail: whole-message cache; make it an LRU if a single message with
+    /// very large inline parts ever matters.
+    private var inlineImageCache: [String: Data] = [:]
+
+    /// Fetches one inline part by Content-ID, for the reader's `cid:` handler.
+    func inlineImage(cid: String, in email: EmailDetail) async -> (data: Data, mimeType: String)? {
+        let wanted = Self.normalizedContentID(cid)
+
+        guard let attachment = (email.attachments ?? []).first(where: {
+            $0.cid.map(Self.normalizedContentID) == wanted
+        }), let blobID = attachment.blobId else {
+            return nil
+        }
+
+        // Only images are served. A `cid:` part is an inline image in practice,
+        // and handing the web view whatever type a sender declared would let a
+        // crafted message get, say, text/html rendered from an attachment.
+        let type = attachment.type ?? ""
+        guard type.lowercased().hasPrefix("image/") else {
+            return nil
+        }
+
+        if let cached = inlineImageCache[blobID] {
+            return (cached, type)
+        }
+
+        guard let client = makeClient(), let session, let accountID,
+              let data = try? await client.downloadBlob(session: session, accountID: accountID, attachment: attachment) else {
+            return nil
+        }
+
+        inlineImageCache[blobID] = data
+
+        return (data, type)
+    }
+
+    /// Fetches one blob by id for the compose preview, where the parts come
+    /// from a forwarded message rather than from the open one.
+    func blobForPreview(blobID: String, type: String) async -> (data: Data, mimeType: String)? {
+        guard type.lowercased().hasPrefix("image/") else {
+            return nil
+        }
+
+        if let cached = inlineImageCache[blobID] {
+            return (cached, type)
+        }
+
+        guard let client = makeClient(), let session, let accountID,
+              let data = try? await client.downloadBlob(
+                session: session,
+                accountID: accountID,
+                attachment: EmailAttachment(blobId: blobID, type: type, name: nil, size: nil, disposition: nil, cid: nil)
+              ) else {
+            return nil
+        }
+
+        inlineImageCache[blobID] = data
+
+        return (data, type)
+    }
+
+    /// Content-IDs appear with or without angle brackets depending on the
+    /// sender, while the `cid:` URL never carries them.
+    nonisolated static func normalizedContentID(_ value: String) -> String {
+        value.trimmingCharacters(in: CharacterSet(charactersIn: "<> ")).lowercased()
     }
 
     // MARK: - Attachments

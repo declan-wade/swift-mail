@@ -17,6 +17,10 @@ struct HTMLMessageView: NSViewRepresentable {
 
     let html: String
     var chrome: Chrome = .transparent
+    /// Resolves a `cid:` reference to renderable bytes. Supplied by the reader
+    /// so a message with dozens of inline parts fetches only the ones the web
+    /// view actually asks to draw.
+    var inlineImageResolver: InlineImageResolver?
     /// When true, the page is loaded with a content rule list that blocks every
     /// remote resource (images, stylesheets, fonts, media), so merely opening a
     /// message never phones home to the sender.
@@ -26,6 +30,11 @@ struct HTMLMessageView: NSViewRepresentable {
         let configuration = WKWebViewConfiguration()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = false
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+
+        // Registered unconditionally: a scheme handler can only be attached to
+        // a configuration before the web view exists, so the handler object is
+        // stable and its resolver is swapped per message in `updateNSView`.
+        configuration.setURLSchemeHandler(context.coordinator.inlineImages, forURLScheme: "cid")
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
@@ -48,6 +57,7 @@ struct HTMLMessageView: NSViewRepresentable {
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         applyChrome(to: webView)
+        context.coordinator.inlineImages.resolve = inlineImageResolver
 
         let needsReload = context.coordinator.loadedHTML != html
             || context.coordinator.loadedChrome != chrome
@@ -102,6 +112,7 @@ struct HTMLMessageView: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
+        let inlineImages = InlineImageSchemeHandler()
         var loadedHTML: String?
         var loadedChrome: Chrome?
         var loadedBlocksRemoteContent: Bool?
@@ -208,5 +219,81 @@ private extension String {
         <body>\(self)</body>
         </html>
         """
+    }
+}
+
+
+/// Resolves a message's `cid:` reference to bytes the reader can draw, or nil
+/// if there is no such inline part.
+typealias InlineImageResolver = @MainActor (String) async -> (data: Data, mimeType: String)?
+
+/// Serves `cid:` inline parts to the reader's web view on demand.
+///
+/// Lazy by construction: WebKit asks only for the parts it is about to draw, so
+/// a reply chain carrying seventy inline images downloads the handful actually
+/// on screen instead of all of them when the message opens.
+@MainActor
+final class InlineImageSchemeHandler: NSObject, WKURLSchemeHandler {
+    var resolve: InlineImageResolver?
+
+    /// Tasks WebKit has not cancelled. Calling back into a stopped task raises
+    /// an Objective-C exception, so every response is gated on still being here.
+    private var live: Set<ObjectIdentifier> = []
+
+    nonisolated func webView(_ webView: WKWebView, start task: any WKURLSchemeTask) {
+        MainActor.assumeIsolated {
+            let key = ObjectIdentifier(task)
+            live.insert(key)
+
+            guard let contentID = Self.contentID(from: task.request.url), let resolve else {
+                finish(task, key: key, with: nil)
+                return
+            }
+
+            Task { @MainActor in
+                let resolved = await resolve(contentID)
+                finish(task, key: key, with: resolved)
+            }
+        }
+    }
+
+    nonisolated func webView(_ webView: WKWebView, stop task: any WKURLSchemeTask) {
+        MainActor.assumeIsolated {
+            live.remove(ObjectIdentifier(task))
+        }
+    }
+
+    private func finish(_ task: any WKURLSchemeTask, key: ObjectIdentifier, with resolved: (data: Data, mimeType: String)?) {
+        guard live.remove(key) != nil else {
+            return
+        }
+
+        guard let resolved, let url = task.request.url else {
+            task.didFailWithError(URLError(.resourceUnavailable))
+            return
+        }
+
+        let response = URLResponse(
+            url: url,
+            mimeType: resolved.mimeType,
+            expectedContentLength: resolved.data.count,
+            textEncodingName: nil
+        )
+
+        task.didReceive(response)
+        task.didReceive(resolved.data)
+        task.didFinish()
+    }
+
+    /// `cid:` URLs are opaque, so the id is whatever follows the scheme.
+    /// Senders quote it inconsistently, hence the percent-decode.
+    private static func contentID(from url: URL?) -> String? {
+        guard let url, url.scheme?.lowercased() == "cid" else {
+            return nil
+        }
+
+        let raw = String(url.absoluteString.dropFirst("cid:".count))
+
+        return (raw.removingPercentEncoding ?? raw).nilIfEmpty
     }
 }

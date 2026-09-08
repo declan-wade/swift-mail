@@ -55,6 +55,12 @@ nonisolated struct ComposeAttachment: Identifiable, Hashable, Codable {
     let name: String
     let type: String
     let size: Int
+    /// Set only for parts a forwarded body references as `cid:`. These ride
+    /// along as inline parts so the original HTML's images still resolve for
+    /// the recipient; they are not listed as attachments in the UI.
+    var contentID: String?
+
+    var isInline: Bool { contentID != nil }
 
     var id: String { blobId }
 
@@ -91,6 +97,10 @@ nonisolated struct ComposeDraft: Identifiable, Hashable, Codable {
     /// Persisted so a reopened window keeps the fields the user revealed.
     var showsCarbonCopy = false
     var attachments: [ComposeAttachment] = []
+    /// The forwarded message's own HTML, kept verbatim and appended below what
+    /// the user writes. Set only by an HTML forward; a Markdown forward leaves
+    /// it nil and quotes the plain-text body instead.
+    var forwardedHTML: String?
 
     var hasRecipients: Bool {
         !(to.isEmpty && cc.isEmpty && bcc.isEmpty)
@@ -102,6 +112,12 @@ nonisolated struct ComposeDraft: Identifiable, Hashable, Codable {
 
     var windowTitle: String {
         subject.nilIfEmpty ?? "New Message"
+    }
+
+    /// What the compose window lists. Inline parts belong to the forwarded
+    /// body, not to the user's own attachments.
+    var listedAttachments: [ComposeAttachment] {
+        attachments.filter { !$0.isInline }
     }
 
     /// Whether anything the user would mind losing differs from `original`.
@@ -206,18 +222,61 @@ nonisolated extension ComposeDraft {
         return draft
     }
 
-    static func forward(_ email: EmailDetail, identity: MailIdentity?) -> ComposeDraft {
+    /// - Parameter preservingHTML: when true the original's own HTML is carried
+    ///   through untouched, along with the inline parts it references, so its
+    ///   layout and images survive. When false the body is flattened to text
+    ///   and quoted as Markdown, which is tidier to edit but loses formatting.
+    static func forward(_ email: EmailDetail, identity: MailIdentity?, preservingHTML: Bool = false) -> ComposeDraft {
         var draft = ComposeDraft(
             mode: .forward,
             identityID: identity?.id,
             bcc: identity?.bcc ?? [],
             subject: email.subjectLine.prefixed(with: "Fwd:"),
-            markdown: signatureBlock(for: identity) + forwardedBody(of: email),
+            markdown: preservingHTML
+                ? signatureBlock(for: identity)
+                : signatureBlock(for: identity) + forwardedBody(of: email),
             originalEmailID: email.id
         )
 
+        if preservingHTML, let html = email.htmlBodyValue {
+            draft.forwardedHTML = forwardedHeaderHTML(of: email) + html
+            draft.attachments = email.forwardableAttachments
+        } else {
+            // Markdown flattens the body to text, so nothing is left to
+            // reference the inline parts by `cid:`. Carrying them anyway would
+            // turn every signature logo into a file attachment; the real
+            // attachments still come along.
+            draft.attachments = email.forwardableAttachments.filter { !$0.isInline }
+        }
+
         draft.applyThreading(from: email)
         return draft
+    }
+
+    /// The same header block the Markdown forward writes, as HTML, so both
+    /// paths announce the forward the same way.
+    private static func forwardedHeaderHTML(of email: EmailDetail) -> String {
+        func escaped(_ value: String) -> String {
+            value
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+        }
+
+        var rows = ["<p><b>---------- Forwarded message ----------</b><br>"]
+        rows.append("<b>From:</b> \(escaped(email.senderLine))<br>")
+
+        if let date = email.receivedAt ?? email.sentAt {
+            rows.append("<b>Date:</b> \(escaped(DateFormatter.mailAttribution.string(from: date)))<br>")
+        }
+
+        rows.append("<b>Subject:</b> \(escaped(email.subjectLine))")
+
+        if !email.recipientLine.isEmpty {
+            rows.append("<br><b>To:</b> \(escaped(email.recipientLine))")
+        }
+
+        return rows.joined() + "</p><hr>"
     }
 
     private mutating func applyThreading(from email: EmailDetail) {

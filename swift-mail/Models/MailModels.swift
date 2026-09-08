@@ -468,15 +468,48 @@ nonisolated struct EmailDetail: Identifiable, Hashable, Decodable {
         return preview ?? ""
     }
 
+    /// The HTML body as it will be rendered — entity-decoded, like
+    /// `htmlDocument`, so a forward carries the same markup the reader shows.
+    var htmlBodyValue: String? {
+        firstBodyValue(from: htmlBody)?.htmlEntityDecoded()
+    }
+
+    /// Everything a forward should carry: the listed attachments plus the
+    /// inline parts the HTML body references by `cid`, which would otherwise
+    /// arrive as broken images.
+    var forwardableAttachments: [ComposeAttachment] {
+        (attachments ?? []).compactMap { attachment in
+            guard let blobId = attachment.blobId else {
+                return nil
+            }
+
+            return ComposeAttachment(
+                blobId: blobId,
+                name: attachment.displayName,
+                type: attachment.type ?? "application/octet-stream",
+                size: attachment.size ?? 0,
+                contentID: attachment.isInline ? attachment.cid : nil
+            )
+        }
+    }
+
     /// Whether the HTML body pulls in resources over the network. Used to decide
     /// whether to offer a "Load Images" affordance before rendering.
     var htmlBodyLoadsRemoteContent: Bool {
-        guard let html = firstBodyValue(from: htmlBody) else {
+        // Decoded exactly as `htmlDocument` decodes it before rendering. A body
+        // whose attribute quotes arrive as `&quot;` reaches the web view as
+        // ordinary `src="https://…"`, so testing the raw text found no remote
+        // content while the renderer loaded it anyway — images blocked, and no
+        // banner offering to unblock them.
+        guard let html = firstBodyValue(from: htmlBody)?.htmlEntityDecoded() else {
             return false
         }
 
+        // `//host/path` is protocol-relative: the web view resolves it to
+        // https, where the content blocker's `^https?://` filter stops it, so
+        // it has to count as remote here too.
         return html.range(
-            of: "(src|background|srcset)\\s*=\\s*[\"']?\\s*https?://|url\\(\\s*[\"']?https?://",
+            of: "(src|background|srcset)\\s*=\\s*[\"']?\\s*(https?:)?//|url\\(\\s*[\"']?(https?:)?//",
             options: [.regularExpression, .caseInsensitive]
         ) != nil
     }

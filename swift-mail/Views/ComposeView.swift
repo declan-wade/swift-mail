@@ -60,6 +60,25 @@ struct ComposeView: View {
         _savedDraft = State(initialValue: draft)
     }
 
+    /// A preserved forward carries the original's inline parts, so the
+    /// recipient preview has to resolve `cid:` the same way the reader does —
+    /// otherwise it shows broken images for a message that will arrive intact.
+    private var inlineImageResolver: InlineImageResolver? {
+        let inline = draft.attachments.filter(\.isInline)
+        guard !inline.isEmpty else {
+            return nil
+        }
+
+        return { [store] contentID in
+            let wanted = MailStore.normalizedContentID(contentID)
+            guard let match = inline.first(where: { $0.contentID.map(MailStore.normalizedContentID) == wanted }) else {
+                return nil
+            }
+
+            return await store.blobForPreview(blobID: match.blobId, type: match.type)
+        }
+    }
+
     private var hasUnsavedChanges: Bool {
         draft.hasChanges(from: savedDraft)
     }
@@ -70,9 +89,9 @@ struct ComposeView: View {
 
             Divider()
 
-            if !draft.attachments.isEmpty || isAttaching {
+            if !draft.listedAttachments.isEmpty || isAttaching {
                 AttachmentStrip(
-                    attachments: draft.attachments,
+                    attachments: draft.listedAttachments,
                     isAttaching: isAttaching,
                     onRemove: { attachment in
                         draft.attachments.removeAll { $0.id == attachment.id }
@@ -273,8 +292,10 @@ struct ComposeView: View {
             MarkdownPreview(markdown: draft.markdown)
         case .recipient:
             HTMLMessageView(
-                html: MarkdownRenderer.htmlDocument(from: debouncedMarkdown, palette: .wire),
-                chrome: .opaque
+                html: MarkdownRenderer.htmlDocument(from: debouncedMarkdown, palette: .wire)
+                    + (draft.forwardedHTML ?? ""),
+                chrome: .opaque,
+                inlineImageResolver: inlineImageResolver
             )
             .background(Color.white)
             .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.medium))

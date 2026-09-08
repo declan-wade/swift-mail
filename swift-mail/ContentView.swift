@@ -29,6 +29,8 @@ struct ContentView: View {
 private struct MailHomeView: View {
     @ObservedObject var store: MailStore
     @Environment(\.openWindow) private var openWindow
+    /// The message a forward is being started for, while the format is chosen.
+    @State private var forwarding: EmailDetail?
 
     var body: some View {
         NavigationSplitView {
@@ -45,6 +47,28 @@ private struct MailHomeView: View {
                     store.backgroundErrorMessage = nil
                 }
             }
+        }
+        .confirmationDialog(
+            "Forward as Markdown or keep the original formatting?",
+            isPresented: Binding(
+                get: { forwarding != nil },
+                set: { if !$0 { forwarding = nil } }
+            ),
+            presenting: forwarding
+        ) { email in
+            Button("Keep Original Formatting") {
+                compose(.forward(email, identity: store.defaultIdentity, preservingHTML: true))
+                forwarding = nil
+            }
+
+            Button("Convert to Markdown") {
+                compose(.forward(email, identity: store.defaultIdentity))
+                forwarding = nil
+            }
+
+            Button("Cancel", role: .cancel) { forwarding = nil }
+        } message: { _ in
+            Text("Markdown is easier to edit but flattens the original message: its layout, styling and inline images are lost. Keeping the original formatting sends its HTML untouched, with your own note above it. Either way, attachments come along.")
         }
         .alert("Mail Error", isPresented: Binding(
             get: { store.errorMessage != nil },
@@ -151,7 +175,7 @@ private struct MailHomeView: View {
 
             Button {
                 if let email = store.selectedEmail {
-                    compose(.forward(email, identity: store.defaultIdentity))
+                    forwarding = email
                 }
             } label: {
                 Label("Forward", systemImage: "arrowshape.turn.up.right")
