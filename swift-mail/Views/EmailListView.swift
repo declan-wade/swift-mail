@@ -72,6 +72,17 @@ struct EmailListView: View {
                         Label(filter.label, systemImage: filter.icon)
                     }
                 }
+
+                // Filters follow the user between folders, so the way out has
+                // to be somewhere obvious rather than only the search field's
+                // clear control.
+                if !store.searchText.isEmpty {
+                    Divider()
+
+                    Button("Clear Search & Filters", systemImage: "xmark.circle") {
+                        store.searchQueryChanged("")
+                    }
+                }
             } label: {
                 Label(
                     "Filter",

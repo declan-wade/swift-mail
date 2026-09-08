@@ -269,18 +269,19 @@ final class MailStore: ObservableObject {
             return
         }
 
-        // Switching mailboxes abandons any in-progress search.
-        if mailboxID != selectedMailboxID, !searchText.isEmpty {
-            searchTask?.cancel()
-            searchText = ""
-        }
-
         // `selectedMailboxID` is no use for spotting a folder change: the
         // sidebar's selection binding has already written the new id before
         // `onChange` gets here. Comparing against the folder the on-screen
         // messages actually came from is what distinguishes a genuine switch
         // from a re-query of the same folder (search, refresh, retry).
         if mailboxID != loadedMailboxID {
+            // A search or filter follows the user from folder to folder;
+            // leaving one is a deliberate act, never a side effect of clicking
+            // a different mailbox. The pending debounce still has to go: it
+            // captured the *old* folder and would reload it over this one a
+            // moment later. The query itself is re-applied below.
+            searchTask?.cancel()
+
             // Dropping the old folder's messages is what lets the skeleton show
             // straight away, instead of the previous folder sitting there until
             // the new page lands.
