@@ -114,6 +114,7 @@ nonisolated struct EmailAddress: Hashable, Codable {
 
 nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
     let id: String
+    let threadId: String?
     let mailboxIds: [String: Bool]?
     let from: [EmailAddress]?
     let to: [EmailAddress]?
@@ -139,6 +140,22 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
         keywords?["$flagged"] == true
     }
 
+    /// Whether a newly arrived message warrants a notification: unread, filed in
+    /// the Inbox, and recent. The recency guard keeps a reconnect after a long
+    /// offline stretch — where `Email/changes` can report a backlog of older
+    /// messages as "created" — from firing a burst of stale notifications.
+    func warrantsNotification(inboxMailboxID: String, now: Date = Date(), maxAge: TimeInterval = 3600) -> Bool {
+        guard isUnread, mailboxIds?[inboxMailboxID] == true else {
+            return false
+        }
+
+        guard let receivedAt else {
+            return true
+        }
+
+        return now.timeIntervalSince(receivedAt) <= maxAge
+    }
+
     func settingSeen(_ isSeen: Bool) -> EmailPreview {
         settingKeyword("$seen", isSeen)
     }
@@ -157,6 +174,7 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
 
         return EmailPreview(
             id: id,
+            threadId: threadId,
             mailboxIds: mailboxIds,
             from: from,
             to: to,

@@ -66,7 +66,112 @@ final class JMAPClient {
         let previews: [EmailPreview]
         let position: Int
         let total: Int?
+        /// The `Email` type state this page was fetched at, so an incremental
+        /// sync can start from a known point rather than re-querying.
+        let state: String?
     }
+
+    /// The current server-side state string for each object type, used as the
+    /// baseline for `Email/changes` / `Mailbox/get` incremental syncs.
+    struct TypeStates {
+        let email: String?
+        let mailbox: String?
+    }
+
+    /// The result of `Email/changes` (RFC 8620 §5.2).
+    struct EmailChanges {
+        let oldState: String
+        let newState: String
+        let created: [String]
+        let updated: [String]
+        let destroyed: [String]
+        let hasMoreChanges: Bool
+    }
+
+    /// Fetches just the `Email` and `Mailbox` type states — a near-empty request
+    /// used by the polling fallback to detect whether anything changed before
+    /// doing any real work.
+    func fetchTypeStates(session: JMAPSession, accountID: String) async throws -> TypeStates {
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                ["Email/get", ["accountId": accountID, "ids": [], "properties": ["id"]], "emailState"],
+                ["Mailbox/get", ["accountId": accountID, "ids": [], "properties": ["id"]], "mailboxState"]
+            ]
+        )
+
+        let emailPayload = try response.payload(named: "Email/get", clientID: "emailState")
+        let mailboxPayload = try response.payload(named: "Mailbox/get", clientID: "mailboxState")
+
+        return TypeStates(
+            email: emailPayload["state"] as? String,
+            mailbox: mailboxPayload["state"] as? String
+        )
+    }
+
+    /// Asks the server which emails were created, updated or destroyed since
+    /// `sinceState`. Throws `JMAPError.methodError("cannotCalculateChanges")`
+    /// when the server can't answer incrementally and the caller must fall back
+    /// to a full reload.
+    func fetchEmailChanges(session: JMAPSession, accountID: String, sinceState: String) async throws -> EmailChanges {
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "Email/changes",
+                    ["accountId": accountID, "sinceState": sinceState, "maxChanges": 200],
+                    "changes"
+                ]
+            ]
+        )
+
+        let payload = try response.payload(named: "Email/changes", clientID: "changes")
+
+        return EmailChanges(
+            oldState: payload["oldState"] as? String ?? sinceState,
+            newState: payload["newState"] as? String ?? sinceState,
+            created: payload["created"] as? [String] ?? [],
+            updated: payload["updated"] as? [String] ?? [],
+            destroyed: payload["destroyed"] as? [String] ?? [],
+            hasMoreChanges: payload["hasMoreChanges"] as? Bool ?? false
+        )
+    }
+
+    /// Fetches previews for a specific set of email ids — the incremental-sync
+    /// counterpart to the paged `fetchEmailPreviews` above.
+    func fetchEmailPreviews(session: JMAPSession, accountID: String, ids: [String]) async throws -> [EmailPreview] {
+        guard !ids.isEmpty else {
+            return []
+        }
+
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "Email/get",
+                    ["accountId": accountID, "ids": ids, "properties": Self.previewProperties],
+                    "emails"
+                ]
+            ]
+        )
+
+        let payload = try response.payload(named: "Email/get", clientID: "emails")
+        let listData = try JSONSerialization.data(withJSONObject: payload["list"] ?? [])
+        return try decoder.decode([EmailPreview].self, from: listData)
+    }
+
+    private static let previewProperties = [
+        "id",
+        "threadId",
+        "mailboxIds",
+        "from",
+        "to",
+        "subject",
+        "receivedAt",
+        "preview",
+        "keywords",
+        "hasAttachment"
+    ]
 
     func fetchEmailPreviews(
         session: JMAPSession,
@@ -76,17 +181,7 @@ final class JMAPClient {
         limit: Int = 50,
         searchText: String? = nil
     ) async throws -> EmailPreviewPage {
-        let properties = [
-            "id",
-            "mailboxIds",
-            "from",
-            "to",
-            "subject",
-            "receivedAt",
-            "preview",
-            "keywords",
-            "hasAttachment"
-        ]
+        let properties = Self.previewProperties
 
         var filter: [String: Any] = ["inMailbox": mailboxID]
         if let searchText = searchText?.trimmingCharacters(in: .whitespacesAndNewlines), !searchText.isEmpty {
@@ -139,7 +234,8 @@ final class JMAPClient {
         return EmailPreviewPage(
             previews: ordered.isEmpty ? previews : ordered,
             position: queryPosition,
-            total: total
+            total: total,
+            state: payload["state"] as? String
         )
     }
 

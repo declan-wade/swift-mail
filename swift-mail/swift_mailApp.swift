@@ -6,12 +6,14 @@
 //
 
 import SwiftUI
+import UserNotifications
 
 @main
 struct swift_mailApp: App {
     /// The store lives at the app level so compose windows can send without being
     /// children of the main window.
     @StateObject private var store = MailStore()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
         WindowGroup {
@@ -25,6 +27,15 @@ struct swift_mailApp: App {
             ComposeView(store: store, draft: draft ?? .blank(identity: store.defaultIdentity))
         }
         .defaultSize(width: 760, height: 620)
+    }
+}
+
+/// Installs the notification-center delegate before the app finishes launching,
+/// so a notification the user acted on to *open* the app is delivered to us.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        _ = NotificationService.shared
     }
 }
 

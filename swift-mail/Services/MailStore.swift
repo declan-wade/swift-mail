@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Combine
+import AppKit
 
 @MainActor
 final class MailStore: ObservableObject {
@@ -37,11 +38,17 @@ final class MailStore: ObservableObject {
     private var bearerToken: String?
     private var autoFetchTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
-    private var knownInboxEmailIDs: Set<EmailPreview.ID> = []
-    private var hasLoadedInitialInboxSnapshot = false
-    private let notificationService = NotificationService()
+    /// The last-seen server state per JMAP type, so background syncs ask the
+    /// server only for what changed (`Email/changes`) instead of re-querying.
+    private var emailState: String?
+    private var mailboxState: String?
+    private var hasWiredNotificationHandler = false
+    private let notificationService = NotificationService.shared
 
     private let emailPageSize = 50
+    /// Cap on `Email/changes` pages walked in one sync, so a pathological
+    /// change backlog can't spin here indefinitely.
+    private let maxChangePages = 25
 
     /// The query the currently displayed `emails` were fetched with, so
     /// background refreshes and load-more stay consistent with what's on screen.
@@ -91,12 +98,15 @@ final class MailStore: ObservableObject {
         self.bearerToken = bearerToken
         session = nil
         accountID = nil
+        emailState = nil
+        mailboxState = nil
         mailboxes = []
         emails = []
         selectedEmail = nil
         selectedMailboxID = nil
         selectedEmailID = nil
         stopAutoFetch()
+        updateDockBadge()
     }
 
     func removeAccount() {
@@ -108,11 +118,14 @@ final class MailStore: ObservableObject {
         bearerToken = nil
         session = nil
         accountID = nil
+        emailState = nil
+        mailboxState = nil
         mailboxes = []
         emails = []
         selectedEmail = nil
         selectedMailboxID = nil
         selectedEmailID = nil
+        updateDockBadge()
     }
 
     func refresh() async {
@@ -134,9 +147,11 @@ final class MailStore: ObservableObject {
             self.session = session
             self.accountID = accountID
             self.mailboxes = mailboxes
+            updateDockBadge()
 
             let inboxID = mailboxes.first { $0.role == "inbox" }?.id ?? mailboxes.first?.id
             selectedMailboxID = selectedMailboxID ?? inboxID
+            await seedSyncStates()
             startAutoFetchIfNeeded(session: session)
             await loadIdentities()
 
@@ -181,10 +196,6 @@ final class MailStore: ObservableObject {
                 limit: emailPageSize,
                 searchText: search
             )
-
-            if search == nil {
-                handleFetchedEmails(page.previews, mailboxID: mailboxID)
-            }
 
             emails = page.previews
             applyPageMetadata(page)
@@ -509,10 +520,27 @@ final class MailStore: ObservableObject {
         return JMAPClient(sessionURL: account.sessionURL, bearerToken: bearerToken)
     }
 
+    // MARK: - Background sync
+
+    /// Records the current server state so the first background sync has a
+    /// baseline to diff against, and won't treat the whole mailbox as "new".
+    private func seedSyncStates() async {
+        guard let client = makeClient(), let session, let accountID else {
+            return
+        }
+
+        if let states = try? await client.fetchTypeStates(session: session, accountID: accountID) {
+            emailState = states.email
+            mailboxState = states.mailbox
+        }
+    }
+
     private func startAutoFetchIfNeeded(session: JMAPSession) {
         guard autoFetchTask == nil, let bearerToken else {
             return
         }
+
+        wireNotificationHandlerIfNeeded()
 
         Task {
             await notificationService.requestAuthorizationIfNeeded()
@@ -523,136 +551,307 @@ final class MailStore: ObservableObject {
                 return
             }
 
-            if let eventSourceURL = session.eventSourceURL(types: ["Email"]) {
-                await self.runEventSourceLoop(
-                    eventSourceURL: eventSourceURL,
-                    bearerToken: bearerToken
-                )
+            if let eventSourceURL = session.eventSourceURL(types: ["Email", "Mailbox"]) {
+                await self.runEventSourceLoop(eventSourceURL: eventSourceURL, bearerToken: bearerToken)
             } else {
-                await self.runFallbackRefreshLoop()
+                await self.runPollingLoop()
             }
         }
     }
 
+    /// Consumes the JMAP push stream. Each `StateChange` carries the new state
+    /// per type; the connection is re-established after the server closes it
+    /// (`closeafter`) or a transport error, with a capped exponential backoff.
     private func runEventSourceLoop(eventSourceURL: URL, bearerToken: String) async {
+        var backoff = Duration.seconds(1)
+
         while !Task.isCancelled {
             do {
                 let eventSource = JMAPEventSource(url: eventSourceURL, bearerToken: bearerToken)
-                for try await _ in eventSource.events() {
+                for try await change in eventSource.events() {
                     try Task.checkCancellation()
-                    await refreshForAutoFetch()
+                    backoff = .seconds(1)
+                    await applyStateChange(change)
                 }
+
+                // A clean end is the server's `closeafter` — reconnect at once
+                // and reconcile anything missed while off the wire.
+                try Task.checkCancellation()
+                await syncNow()
             } catch is CancellationError {
                 return
             } catch {
-                try? await Task.sleep(for: .seconds(15))
+                try? await Task.sleep(for: backoff)
+                backoff = min(backoff * 2, .seconds(120))
             }
         }
     }
 
-    private func runFallbackRefreshLoop() async {
+    /// Fallback for servers that don't advertise an event source: poll the
+    /// cheap type-state endpoint and only do real work when something moved.
+    private func runPollingLoop() async {
         while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(120))
+            try? await Task.sleep(for: .seconds(90))
             guard !Task.isCancelled else {
                 return
             }
 
-            await refreshForAutoFetch()
+            await syncNow()
         }
     }
 
-    private func refreshForAutoFetch() async {
+    /// Polls current type states and reconciles anything that changed.
+    private func syncNow() async {
         guard let client = makeClient(), let session, let accountID else {
-            await refresh()
             return
         }
 
         do {
-            let mailboxes = try await client.fetchMailboxes(session: session, accountID: accountID)
-            self.mailboxes = mailboxes
+            let states = try await client.fetchTypeStates(session: session, accountID: accountID)
 
-            let inboxID = mailboxes.first(where: { $0.role == "inbox" })?.id
-
-            // Keep the Inbox snapshot current for new-message notifications even
-            // when the user is looking at another mailbox. When the Inbox *is*
-            // the visible list, fetch as far as the user has scrolled so a
-            // background refresh doesn't truncate loaded pages.
-            if let inboxID {
-                let inboxLimit = selectedMailboxID == inboxID ? max(emailPageSize, emails.count) : emailPageSize
-                let inboxPage = try await client.fetchEmailPreviews(
-                    session: session,
-                    accountID: accountID,
-                    mailboxID: inboxID,
-                    limit: inboxLimit
-                )
-                handleFetchedEmails(inboxPage.previews, mailboxID: inboxID)
-
-                if selectedMailboxID == inboxID, activeSearch == nil {
-                    applyRefreshedList(inboxPage)
-                }
+            if let mailbox = states.mailbox, mailbox != mailboxState {
+                await syncMailboxes(newState: mailbox)
             }
 
-            // A non-Inbox selection would otherwise go stale until a manual
-            // refresh — fetch the range the user currently has scrolled to.
-            if let selectedMailboxID, selectedMailboxID != inboxID, activeSearch == nil {
-                let page = try await client.fetchEmailPreviews(
-                    session: session,
-                    accountID: accountID,
-                    mailboxID: selectedMailboxID,
-                    limit: max(emailPageSize, emails.count)
-                )
-
-                guard self.selectedMailboxID == selectedMailboxID, activeSearch == nil else {
-                    return
-                }
-
-                applyRefreshedList(page)
+            if let email = states.email, email != emailState {
+                await syncEmailChanges(newState: email)
             }
         } catch {
             backgroundErrorMessage = error.localizedDescription
         }
     }
 
-    /// Replaces the visible list from a background refresh without disturbing the
-    /// user's current selection or scroll depth.
-    private func applyRefreshedList(_ page: JMAPClient.EmailPreviewPage) {
-        let previousSelection = selectedEmailID
-        emails = page.previews
-        applyPageMetadata(page)
+    private func applyStateChange(_ change: JMAPStateChange) async {
+        guard let accountID else {
+            return
+        }
 
-        if let previousSelection, page.previews.contains(where: { $0.id == previousSelection }) {
-            selectedEmailID = previousSelection
-        } else {
-            selectedEmailID = page.previews.first?.id
+        if let mailbox = change.state(for: "Mailbox", accountID: accountID), mailbox != mailboxState {
+            await syncMailboxes(newState: mailbox)
+        }
+
+        if let email = change.state(for: "Email", accountID: accountID), email != emailState {
+            await syncEmailChanges(newState: email)
         }
     }
 
-    private func handleFetchedEmails(_ fetchedEmails: [EmailPreview], mailboxID: Mailbox.ID) {
-        guard mailboxes.first(where: { $0.id == mailboxID })?.role == "inbox" else {
+    /// Re-reads mailboxes for their counts (drives the sidebar and the dock
+    /// badge). Cheap enough to do wholesale on any `Mailbox` state change.
+    private func syncMailboxes(newState: String) async {
+        guard let client = makeClient(), let session, let accountID else {
             return
         }
 
-        let fetchedIDs = Set(fetchedEmails.map(\.id))
-        defer {
-            knownInboxEmailIDs = fetchedIDs
-            hasLoadedInitialInboxSnapshot = true
+        do {
+            mailboxes = try await client.fetchMailboxes(session: session, accountID: accountID)
+            mailboxState = newState
+            updateDockBadge()
+        } catch {
+            backgroundErrorMessage = error.localizedDescription
         }
+    }
 
-        guard hasLoadedInitialInboxSnapshot else {
+    /// Walks `Email/changes` from the last-seen state and applies only the
+    /// deltas. Falls back to a full reload of the visible list if the server
+    /// can't answer incrementally (`cannotCalculateChanges`) or anything else
+    /// goes wrong — without firing notifications, to avoid a stale burst.
+    private func syncEmailChanges(newState: String) async {
+        guard let client = makeClient(), let session, let accountID else {
             return
         }
 
-        let newMessages = fetchedEmails.filter { email in
-            !knownInboxEmailIDs.contains(email.id) && email.isUnread
-        }
-
-        guard !newMessages.isEmpty else {
+        guard let since = emailState else {
+            emailState = newState
             return
         }
 
-        Task {
-            await notificationService.notifyNewMessages(newMessages, mailboxName: "Inbox")
+        do {
+            var cursor = since
+            var created: [String] = []
+            var updated: [String] = []
+            var destroyed: [String] = []
+
+            for _ in 0..<maxChangePages {
+                let changes = try await client.fetchEmailChanges(
+                    session: session,
+                    accountID: accountID,
+                    sinceState: cursor
+                )
+
+                created += changes.created
+                updated += changes.updated.filter { !changes.created.contains($0) }
+                destroyed += changes.destroyed
+                cursor = changes.newState
+
+                if !changes.hasMoreChanges {
+                    break
+                }
+            }
+
+            let destroyedSet = Set(destroyed)
+            let createdSet = Set(created).subtracting(destroyedSet)
+            let toFetch = Array(createdSet.union(updated).subtracting(destroyedSet)).prefix(100)
+
+            let previews = try await client.fetchEmailPreviews(
+                session: session,
+                accountID: accountID,
+                ids: Array(toFetch)
+            )
+
+            emailState = cursor
+            applyEmailDeltas(previews: previews, createdIDs: createdSet, destroyedIDs: destroyedSet)
+        } catch {
+            emailState = newState
+            await reloadVisibleList()
         }
+    }
+
+    /// Merges an incremental `Email` delta into the visible list and posts
+    /// notifications for genuinely new Inbox mail.
+    private func applyEmailDeltas(
+        previews: [EmailPreview],
+        createdIDs: Set<String>,
+        destroyedIDs: Set<String>
+    ) {
+        // Destroyed messages leave every list, and the selection with them.
+        if !destroyedIDs.isEmpty {
+            let hadSelection = selectedEmailID.map(destroyedIDs.contains) ?? false
+            emails.removeAll { destroyedIDs.contains($0.id) }
+            if hadSelection {
+                selectedEmailID = emails.first?.id
+                if let selectedEmailID {
+                    Task { await loadEmailDetail(emailID: selectedEmailID) }
+                } else {
+                    selectedEmail = nil
+                }
+            }
+        }
+
+        let inboxID = mailboxes.first { $0.role == "inbox" }?.id
+        let byID = Dictionary(previews.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+
+        // Updated messages already on screen: refresh in place so read/flag
+        // changes made on another device show up live.
+        emails = emails.map { byID[$0.id] ?? $0 }
+
+        // Keep the open message's read/flag state in step with other devices.
+        if let selectedEmailID, let refreshed = byID[selectedEmailID], selectedEmail != nil {
+            selectedEmail = selectedEmail?
+                .settingSeen(!refreshed.isUnread)
+                .settingFlagged(refreshed.isFlagged)
+        }
+
+        // New messages belonging to the currently displayed mailbox drop in at
+        // the top (the list is sorted newest-first) if not already present.
+        if let selectedMailboxID, activeSearch == nil {
+            let known = Set(emails.map(\.id))
+            let additions = previews
+                .filter { createdIDs.contains($0.id) && $0.mailboxIds?[selectedMailboxID] == true && !known.contains($0.id) }
+                .sorted { ($0.receivedAt ?? .distantPast) > ($1.receivedAt ?? .distantPast) }
+            emails.insert(contentsOf: additions, at: 0)
+        }
+
+        // Notifications: only new, unread, recent Inbox mail.
+        if let inboxID {
+            let notifiable = previews.filter {
+                createdIDs.contains($0.id) && $0.warrantsNotification(inboxMailboxID: inboxID)
+            }
+
+            if !notifiable.isEmpty {
+                Task {
+                    await notificationService.notifyNewMessages(notifiable, mailboxName: "Inbox")
+                }
+            }
+        }
+    }
+
+    /// Rebuilds the visible mailbox listing after an incremental sync bailed,
+    /// preserving the user's selection and scroll depth.
+    private func reloadVisibleList() async {
+        guard let client = makeClient(),
+              let session,
+              let accountID,
+              let mailboxID = selectedMailboxID,
+              activeSearch == nil else {
+            return
+        }
+
+        do {
+            let page = try await client.fetchEmailPreviews(
+                session: session,
+                accountID: accountID,
+                mailboxID: mailboxID,
+                limit: max(emailPageSize, emails.count)
+            )
+
+            guard selectedMailboxID == mailboxID, activeSearch == nil else {
+                return
+            }
+
+            let previousSelection = selectedEmailID
+            emails = page.previews
+            applyPageMetadata(page)
+
+            if let previousSelection, page.previews.contains(where: { $0.id == previousSelection }) {
+                selectedEmailID = previousSelection
+            } else {
+                selectedEmailID = page.previews.first?.id
+            }
+        } catch {
+            backgroundErrorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Dock badge
+
+    /// Mirrors the Inbox unread count onto the dock icon, matching Mail.
+    private func updateDockBadge() {
+        let unread = mailboxes.first { $0.role == "inbox" }?.unreadEmails ?? 0
+        NSApp.dockTile.badgeLabel = unread > 0 ? String(unread) : nil
+    }
+
+    // MARK: - Notification actions
+
+    private func wireNotificationHandlerIfNeeded() {
+        guard !hasWiredNotificationHandler else {
+            return
+        }
+
+        hasWiredNotificationHandler = true
+        notificationService.actionHandler = { [weak self] action in
+            Task { await self?.handleNotificationAction(action) }
+        }
+    }
+
+    private func handleNotificationAction(_ action: NotificationService.Action) async {
+        switch action {
+        case .open(let emailID):
+            await openFromNotification(emailID: emailID)
+        case .markRead(let emailID):
+            await setReadState(emailID: emailID, isRead: true)
+            notificationService.clearNotifications(for: [emailID])
+        case .archive(let emailID):
+            await moveEmail(emailID: emailID, toRole: "archive")
+            notificationService.clearNotifications(for: [emailID])
+        case .trash(let emailID):
+            await moveEmail(emailID: emailID, toRole: "trash")
+            notificationService.clearNotifications(for: [emailID])
+        }
+    }
+
+    private func openFromNotification(emailID: EmailPreview.ID) async {
+        notificationService.clearNotifications(for: [emailID])
+
+        if session == nil {
+            await refresh()
+        }
+
+        if let inboxID = mailboxes.first(where: { $0.role == "inbox" })?.id, selectedMailboxID != inboxID {
+            await loadEmails(mailboxID: inboxID)
+        }
+
+        selectedEmailID = emailID
+        await loadEmailDetail(emailID: emailID)
     }
 
     private func applyReadState(emailID: EmailPreview.ID, isRead: Bool, wasUnread: Bool) {
@@ -666,6 +865,10 @@ final class MailStore: ObservableObject {
 
         if selectedEmail?.id == emailID {
             selectedEmail = selectedEmail?.settingSeen(isRead)
+        }
+
+        if isRead {
+            notificationService.clearNotifications(for: [emailID])
         }
 
         updateSelectedMailboxUnreadCount(wasUnread: wasUnread, isUnread: !isRead)
@@ -736,6 +939,8 @@ final class MailStore: ObservableObject {
                 unreadEmails: adjustedUnread
             )
         }
+
+        updateDockBadge()
     }
 
     private func loadSavedAccount() {
