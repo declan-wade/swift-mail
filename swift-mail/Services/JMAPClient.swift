@@ -235,6 +235,81 @@ final class JMAPClient {
         )
     }
 
+    /// Ids only, no `Email/get`. Sweep needs the whole matching set before it
+    /// moves anything, and fetching previews for thousands of messages just to
+    /// read their ids would be wasted traffic.
+    func fetchEmailIDs(
+        session: JMAPSession,
+        accountID: String,
+        searchFilter: [String: Any],
+        position: Int,
+        limit: Int
+    ) async throws -> (ids: [String], total: Int?) {
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "Email/query",
+                    [
+                        "accountId": accountID,
+                        "filter": searchFilter,
+                        "sort": [["property": "receivedAt", "isAscending": false]],
+                        "position": position,
+                        "limit": limit,
+                        "calculateTotal": true
+                    ],
+                    "query"
+                ]
+            ]
+        )
+
+        let payload = try response.payload(named: "Email/query", clientID: "query")
+
+        return ((payload["ids"] as? [String]) ?? [], payload["total"] as? Int)
+    }
+
+    /// Moves many messages in one `Email/set`. Replacing `mailboxIds` wholesale
+    /// is what "move" means, and it's identical for every id, so the whole
+    /// batch is one update object.
+    ///
+    /// Returns the ids the server refused, so the caller can report a partial
+    /// result rather than claiming a clean sweep.
+    func moveEmails(
+        session: JMAPSession,
+        accountID: String,
+        emailIDs: [String],
+        toMailboxID mailboxID: String
+    ) async throws -> [String] {
+        guard !emailIDs.isEmpty else {
+            return []
+        }
+
+        // `uniquingKeysWith`, not `uniqueKeysWithValues`: a repeated id would
+        // trap, and paging a live mailbox can hand us one.
+        let update = Dictionary(
+            emailIDs.map { ($0, ["mailboxIds": [mailboxID: true]]) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "Email/set",
+                    [
+                        "accountId": accountID,
+                        "update": update
+                    ],
+                    "moveEmails"
+                ]
+            ]
+        )
+
+        let payload = try response.payload(named: "Email/set", clientID: "moveEmails")
+
+        return Array((payload["notUpdated"] as? [String: Any])?.keys ?? [:].keys)
+    }
+
     func fetchEmailDetail(session: JMAPSession, accountID: String, emailID: String) async throws -> EmailDetail {
         let response = try await call(
             apiURL: session.apiURL,

@@ -3,6 +3,7 @@ import SwiftUI
 struct EmailListView: View {
     @ObservedObject var store: MailStore
     @Environment(\.openWindow) private var openWindow
+    @State private var isSweeping = false
 
     private var searchBinding: Binding<String> {
         Binding(
@@ -16,6 +17,9 @@ struct EmailListView: View {
             .navigationTitle(store.selectedMailbox?.displayName ?? "Inbox")
             .navigationSplitViewColumnWidth(min: Theme.Column.list.min, ideal: Theme.Column.list.ideal)
             .toolbar { listToolbar }
+            .sheet(isPresented: $isSweeping) {
+                SweepView(store: store)
+            }
             .searchable(text: searchBinding, prompt: "Search — try from: subject: after:")
             .searchSuggestions {
                 ForEach(store.searchSuggestions) { suggestion in
@@ -42,17 +46,31 @@ struct EmailListView: View {
             }
     }
 
-    /// Lives on the content column, so these sit above the message list rather
-    /// than out in the reader's toolbar with the per-message actions.
+    /// Whole-mailbox actions, as opposed to the per-message ones in the window
+    /// toolbar. Declaring `.toolbar` on the content column does *not* place
+    /// items above that column — a NavigationSplitView has one shared toolbar,
+    /// and these just landed at its trailing end past the account menu.
+    /// `.navigation` is what puts them at the leading edge, over the list.
     @ToolbarContentBuilder
     private var listToolbar: some ToolbarContent {
-        ToolbarItemGroup {
+        ToolbarItemGroup(placement: .navigation) {
             Button {
                 openWindow(id: ComposeWindow.id, value: ComposeDraft.blank(identity: store.defaultIdentity))
             } label: {
                 Label("New Message", systemImage: "square.and.pencil")
             }
             .help("New Message (⌘N)")
+
+            Button {
+                isSweeping = true
+            } label: {
+                // SF Symbols has no broom; this is the closest "tidy in bulk"
+                // metaphor and stays distinct from the pencil, arrows and
+                // filter lines beside it.
+                Label("Sweep", systemImage: "wand.and.sparkles")
+            }
+            .help("Sweep — bulk-move messages matching a search")
+            .disabled(store.selectedMailboxID == nil)
 
             Button {
                 Task { await store.refresh() }
@@ -196,6 +214,8 @@ private struct EmailRow: View {
     let email: EmailPreview
     @ObservedObject var store: MailStore
     @State private var isHovering = false
+    @AppStorage(SwipePreferences.leadingKey) private var leading = SwipePreferences.leadingDefault.rawValue
+    @AppStorage(SwipePreferences.trailingKey) private var trailing = SwipePreferences.trailingDefault.rawValue
 
     var body: some View {
         HStack(alignment: .top, spacing: Theme.Spacing.sm) {
@@ -257,6 +277,27 @@ private struct EmailRow: View {
             withAnimation(Theme.Motion.hover) {
                 isHovering = hovering
             }
+        }
+        // Two-finger trackpad swipe. `allowsFullSwipe` is off: these are the
+        // same destructive actions the toolbar guards behind a deliberate
+        // click, and a full swipe fires them on momentum alone.
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            swipeButton(for: SwipeAction(rawValue: leading) ?? SwipePreferences.leadingDefault)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            swipeButton(for: SwipeAction(rawValue: trailing) ?? SwipePreferences.trailingDefault)
+        }
+    }
+
+    @ViewBuilder
+    private func swipeButton(for action: SwipeAction) -> some View {
+        if action != .none {
+            Button(role: action == .delete ? .destructive : nil) {
+                Task { await action.perform(on: email, in: store) }
+            } label: {
+                Label(action.label(for: email), systemImage: action.icon(for: email))
+            }
+            .tint(action.tint)
         }
     }
 

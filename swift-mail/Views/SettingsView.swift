@@ -1,14 +1,48 @@
 import SwiftUI
 
-/// Reading and per-folder notification preferences.
-///
-/// Fastmail's server-side rules file mail into folders before the client ever
-/// sees it, and JMAP carries no per-mailbox "notify me" flag, so the choice
-/// lives here instead of on the server.
+/// The Settings window, split the way macOS expects: a small number of
+/// noun-named tabs, each pane a grouped `Form` at a shared width so the window
+/// only ever changes height between tabs.
 struct SettingsView: View {
     @ObservedObject var store: MailStore
-    @AppStorage(NotifyingMailboxes.storageKey) private var notifyingList = ""
+
+    var body: some View {
+        TabView {
+            Tab("General", systemImage: "gearshape") {
+                GeneralSettings()
+            }
+
+            Tab("Notifications", systemImage: "bell") {
+                NotificationSettings(store: store)
+            }
+
+            Tab("Advanced", systemImage: "wrench.and.screwdriver") {
+                AdvancedSettings(store: store)
+            }
+        }
+        .frame(width: SettingsPane.width)
+    }
+}
+
+/// Shared pane geometry. A Settings window isn't user-resizable, so the width
+/// is fixed once here and each pane states only its own height.
+private enum SettingsPane {
+    static let width: CGFloat = 480
+}
+
+private extension View {
+    func settingsPane(height: CGFloat) -> some View {
+        formStyle(.grouped).frame(width: SettingsPane.width, height: height)
+    }
+}
+
+// MARK: - General
+
+/// How a message behaves when you read it or swipe it.
+private struct GeneralSettings: View {
     @AppStorage(ReadingPreferences.marksReadOnOpenKey) private var marksReadOnOpen = false
+    @AppStorage(SwipePreferences.leadingKey) private var leadingSwipe = SwipePreferences.leadingDefault.rawValue
+    @AppStorage(SwipePreferences.trailingKey) private var trailingSwipe = SwipePreferences.trailingDefault.rawValue
 
     var body: some View {
         Form {
@@ -20,6 +54,44 @@ struct SettingsView: View {
                 .pickerStyle(.radioGroup)
             }
 
+            Section {
+                Picker("Swipe right", selection: $leadingSwipe) {
+                    swipeOptions
+                }
+
+                Picker("Swipe left", selection: $trailingSwipe) {
+                    swipeOptions
+                }
+            } header: {
+                Text("Swipe Actions")
+            } footer: {
+                Text("Two-finger swipe across a message in the list. Swipe right reveals the action on the left edge, swipe left the one on the right.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .settingsPane(height: 330)
+    }
+
+    @ViewBuilder
+    private var swipeOptions: some View {
+        ForEach(SwipeAction.allCases) { action in
+            Text(action.settingsLabel).tag(action.rawValue)
+        }
+    }
+}
+
+// MARK: - Notifications
+
+/// Fastmail's server-side rules file mail into folders before the client ever
+/// sees it, and JMAP carries no per-mailbox "notify me" flag, so the choice
+/// lives here instead of on the server.
+private struct NotificationSettings: View {
+    @ObservedObject var store: MailStore
+    @AppStorage(NotifyingMailboxes.storageKey) private var notifyingList = ""
+
+    var body: some View {
+        Form {
             Section {
                 if store.mailboxes.isEmpty {
                     Text("Connect an account to choose folders.")
@@ -38,7 +110,37 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+        // Taller than the others on purpose: this is a list of every folder,
+        // and it scrolls inside the pane rather than growing the window.
+        .settingsPane(height: 460)
+    }
 
+    private func binding(for mailbox: Mailbox) -> Binding<Bool> {
+        Binding(
+            get: { NotifyingMailboxes.ids(in: notifyingList).contains(mailbox.id) },
+            set: { isOn in
+                var ids = NotifyingMailboxes.ids(in: notifyingList)
+                if isOn {
+                    ids.insert(mailbox.id)
+                } else {
+                    ids.remove(mailbox.id)
+                }
+
+                notifyingList = NotifyingMailboxes.list(from: ids)
+            }
+        )
+    }
+}
+
+// MARK: - Advanced
+
+/// Read-only diagnostics about the connected server.
+private struct AdvancedSettings: View {
+    @ObservedObject var store: MailStore
+
+    var body: some View {
+        Form {
             Section {
                 if store.serverCapabilities.isEmpty {
                     Text("Connect an account to see what the server supports.")
@@ -60,23 +162,8 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .formStyle(.grouped)
-        .frame(width: 440, height: 540)
-    }
-
-    private func binding(for mailbox: Mailbox) -> Binding<Bool> {
-        Binding(
-            get: { NotifyingMailboxes.ids(in: notifyingList).contains(mailbox.id) },
-            set: { isOn in
-                var ids = NotifyingMailboxes.ids(in: notifyingList)
-                if isOn {
-                    ids.insert(mailbox.id)
-                } else {
-                    ids.remove(mailbox.id)
-                }
-
-                notifyingList = NotifyingMailboxes.list(from: ids)
-            }
-        )
+        // Sized to the capability list this server actually returns, with room
+        // for a couple more; a longer list scrolls rather than stretching.
+        .settingsPane(height: 240)
     }
 }

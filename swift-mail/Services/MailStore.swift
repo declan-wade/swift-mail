@@ -511,6 +511,123 @@ final class MailStore: ObservableObject {
         await moveEmail(emailID: emailID, toRole: "trash")
     }
 
+    // MARK: - Sweep
+
+    /// What a sweep would touch: the first page for the user to look at, and
+    /// the server's count of the whole match.
+    struct SweepPreview {
+        let previews: [EmailPreview]
+        let total: Int?
+    }
+
+    /// Hard ceiling on one sweep. A runaway query shouldn't be able to move an
+    /// entire account in a single click, and stopping short is recoverable
+    /// where moving 50,000 messages is not.
+    /// ponytail: fixed cap; make it a prompt ("sweep the first 5,000?") if
+    /// anyone actually hits it.
+    private static let sweepLimit = 5_000
+    /// Well under any server's `maxObjectsInSet`, which this client doesn't
+    /// read. ponytail: raise it by decoding the core capability if sweeps of
+    /// tens of thousands ever feel slow.
+    private static let sweepBatchSize = 100
+
+    /// The filter a sweep would run, or nil if the query is empty. An empty
+    /// query must never mean "everything in this folder".
+    nonisolated static func sweepFilter(query: String, mailboxID: Mailbox.ID?, mailboxes: [Mailbox]) -> [String: Any]? {
+        guard let mailboxID else {
+            return nil
+        }
+
+        // The guard is on what the query *parses to*, not on whether the string
+        // looks blank. `""` is two characters and trims to two characters, but
+        // tokenizes to nothing — and a query of no terms leaves a filter of
+        // nothing but `inMailbox`, which is the whole folder.
+        let parsed = SearchQuery(query)
+        guard !parsed.terms.isEmpty else {
+            return nil
+        }
+
+        return parsed.jmapFilter(mailboxID: mailboxID, mailboxes: mailboxes)
+    }
+
+    private func sweepFilter(query: String) -> [String: Any]? {
+        Self.sweepFilter(query: query, mailboxID: selectedMailboxID, mailboxes: mailboxes)
+    }
+
+    func previewSweep(query: String) async throws -> SweepPreview {
+        guard let client = makeClient(), let session, let accountID,
+              let mailboxID = selectedMailboxID, let filter = sweepFilter(query: query) else {
+            return SweepPreview(previews: [], total: 0)
+        }
+
+        let page = try await client.fetchEmailPreviews(
+            session: session,
+            accountID: accountID,
+            mailboxID: mailboxID,
+            position: 0,
+            limit: emailPageSize,
+            searchFilter: filter
+        )
+
+        return SweepPreview(previews: page.previews, total: page.total)
+    }
+
+    /// Moves every message matching `query` into `mailboxID`. Returns how many
+    /// actually moved.
+    func performSweep(query: String, toMailboxID mailboxID: String) async throws -> Int {
+        guard let client = makeClient(), let session, let accountID,
+              let filter = sweepFilter(query: query) else {
+            return 0
+        }
+
+        // The whole id set is collected *before* anything moves. Moving as we
+        // page would shift every later position out from under us, because the
+        // messages we just moved drop out of the query's own results.
+        var ids: [String] = []
+        var seen: Set<String> = []
+        var position = 0
+
+        while ids.count < Self.sweepLimit {
+            let page = try await client.fetchEmailIDs(
+                session: session,
+                accountID: accountID,
+                searchFilter: filter,
+                position: position,
+                limit: Self.sweepBatchSize
+            )
+
+            // Mail arriving mid-page shifts every later position down, which
+            // hands back an id we already have. Page by a position that counts
+            // what the server returned, and keep only ids we haven't seen.
+            position += page.ids.count
+            ids += page.ids.filter { seen.insert($0).inserted }
+
+            if page.ids.count < Self.sweepBatchSize {
+                break
+            }
+        }
+
+        var moved = 0
+
+        for start in stride(from: 0, to: ids.count, by: Self.sweepBatchSize) {
+            let batch = Array(ids[start..<min(start + Self.sweepBatchSize, ids.count)])
+            let refused = try await client.moveEmails(
+                session: session,
+                accountID: accountID,
+                emailIDs: batch,
+                toMailboxID: mailboxID
+            )
+
+            moved += batch.count - refused.count
+        }
+
+        if moved > 0 {
+            await refresh()
+        }
+
+        return moved
+    }
+
     // MARK: - Compose
 
     /// Identities are optional: an account without submission support can still
