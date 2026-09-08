@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Per-folder notification preferences.
+/// Reading and per-folder notification preferences.
 ///
 /// Fastmail's server-side rules file mail into folders before the client ever
 /// sees it, and JMAP carries no per-mailbox "notify me" flag, so the choice
@@ -8,9 +8,18 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var store: MailStore
     @AppStorage(NotifyingMailboxes.storageKey) private var notifyingList = ""
+    @AppStorage(ReadingPreferences.marksReadOnOpenKey) private var marksReadOnOpen = false
 
     var body: some View {
         Form {
+            Section("Reading") {
+                Picker("Mark messages as read", selection: $marksReadOnOpen) {
+                    Text("When I click Mark as Read").tag(false)
+                    Text("When I open the message").tag(true)
+                }
+                .pickerStyle(.radioGroup)
+            }
+
             Section {
                 if store.mailboxes.isEmpty {
                     Text("Connect an account to choose folders.")
@@ -31,7 +40,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 420, height: 460)
+        .frame(width: 440, height: 540)
     }
 
     private func binding(for mailbox: Mailbox) -> Binding<Bool> {

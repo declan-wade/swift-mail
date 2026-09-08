@@ -34,6 +34,17 @@ nonisolated enum NotifyingMailboxes {
     }
 }
 
+/// How the reader treats the message it opens.
+nonisolated enum ReadingPreferences {
+    /// Off (the default) keeps the explicit Mark as Read button as the only way
+    /// a message loses its unread state.
+    static let marksReadOnOpenKey = "swift-mail.marksReadOnOpen"
+
+    static var marksReadOnOpen: Bool {
+        UserDefaults.standard.bool(forKey: marksReadOnOpenKey)
+    }
+}
+
 @MainActor
 final class MailStore: ObservableObject {
     @Published var account: MailAccount?
@@ -329,6 +340,14 @@ final class MailStore: ObservableObject {
         }
 
         isLoadingSelectedEmail = false
+
+        // Every path that opens a message in the reader lands here, so this is
+        // the one place the "read on open" preference has to be honoured.
+        if ReadingPreferences.marksReadOnOpen,
+           selectedEmailID == emailID,
+           selectedEmail?.isUnread == true {
+            await setReadState(emailID: emailID, isRead: true)
+        }
     }
 
     func setReadState(emailID: EmailPreview.ID, isRead: Bool) async {
