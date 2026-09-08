@@ -422,6 +422,33 @@ final class JMAPClient {
         }
     }
 
+    /// What the server returns from the upload endpoint (RFC 8620 6.1).
+    nonisolated struct UploadedBlob: Decodable {
+        let blobId: String
+        let type: String?
+        let size: Int?
+    }
+
+    /// Uploads one file and returns its blob. A blob is referenced by id when
+    /// the message is created, so this happens once per file rather than being
+    /// re-sent for every draft save.
+    func uploadBlob(session: JMAPSession, accountID: String, data: Data, type: String) async throws -> UploadedBlob {
+        guard let url = session.uploadURL(accountID: accountID) else {
+            throw JMAPError.missingUploadURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(type, forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (responseData, response) = try await urlSession.upload(for: request, from: data)
+        try validate(response: response, data: responseData)
+
+        return try decoder.decode(UploadedBlob.self, from: responseData)
+    }
+
     // MARK: - Compose
 
     func fetchIdentities(session: JMAPSession, accountID: String) async throws -> [MailIdentity] {
@@ -606,6 +633,39 @@ final class JMAPClient {
     /// The body parts carry no `charset`: RFC 8621 4.6 says it MUST be omitted
     /// when a `partId` is given, and Fastmail enforces that with
     /// `invalidProperties`, which rejected every send.
+    /// The alternative text/html pair, wrapped in a `multipart/mixed` alongside
+    /// the attachment parts when there are any. Staying with `bodyStructure`
+    /// rather than switching to the `textBody`/`htmlBody`/`attachments`
+    /// convenience form keeps one convention: RFC 8621 4.1.4 allows either, but
+    /// not both in the same create.
+    private static func bodyStructure(for draft: ComposeDraft) -> [String: Any] {
+        let alternative: [String: Any] = [
+            "type": "multipart/alternative",
+            "subParts": [
+                ["partId": "text", "type": "text/plain"],
+                ["partId": "html", "type": "text/html"]
+            ]
+        ]
+
+        guard !draft.attachments.isEmpty else {
+            return alternative
+        }
+
+        let parts: [[String: Any]] = draft.attachments.map { attachment in
+            [
+                "blobId": attachment.blobId,
+                "type": attachment.type,
+                "name": attachment.name,
+                "disposition": "attachment"
+            ]
+        }
+
+        return [
+            "type": "multipart/mixed",
+            "subParts": [alternative] + parts
+        ]
+    }
+
     static func emailObject(
         draft: ComposeDraft,
         identity: MailIdentity,
@@ -617,13 +677,7 @@ final class JMAPClient {
             "keywords": keywords,
             "from": addressList([identity.address]),
             "subject": draft.subject,
-            "bodyStructure": [
-                "type": "multipart/alternative",
-                "subParts": [
-                    ["partId": "text", "type": "text/plain"],
-                    ["partId": "html", "type": "text/html"]
-                ]
-            ],
+            "bodyStructure": bodyStructure(for: draft),
             "bodyValues": [
                 "text": ["value": MarkdownRenderer.plainText(from: draft.markdown)],
                 "html": ["value": MarkdownRenderer.htmlDocument(from: draft.markdown)]
@@ -776,6 +830,8 @@ enum JMAPError: LocalizedError {
     case missingIdentity
     case missingMailAccount
     case missingDownloadURL
+    case missingUploadURL
+    case attachmentTooLarge(String, Int)
     case missingMailbox(String)
     case missingMethodResponse(String)
     case setError(String, String?)
@@ -802,6 +858,10 @@ enum JMAPError: LocalizedError {
             return "The JMAP session does not expose a mail account."
         case .missingDownloadURL:
             return "This attachment has no downloadable content."
+        case .missingUploadURL:
+            return "This account does not advertise an upload endpoint, so files can't be attached."
+        case .attachmentTooLarge(let name, let limit):
+            return "\(name) is larger than the \(Int64(limit).formatted(.byteCount(style: .file))) this server accepts."
         case .missingMailbox(let role):
             return "This account has no \(role) mailbox, so the message could not be filed."
         case .missingMethodResponse(let method):

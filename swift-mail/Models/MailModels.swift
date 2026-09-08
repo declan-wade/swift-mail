@@ -12,6 +12,8 @@ nonisolated struct JMAPSession: Decodable {
     /// Kept as the raw string: RFC 8620 6.2 defines it as a URI template, and
     /// `URL` percent-encodes the `{}` placeholders on decode.
     let downloadURLTemplate: String?
+    /// RFC 8620 6.1, a URI template whose only variable is `{accountId}`.
+    let uploadURLTemplate: String?
     let primaryAccounts: [String: String]
     /// Optional so a server that omits it still logs in; RFC 8620 2 requires it.
     let capabilities: [String: JMAPCapabilityProperties]?
@@ -69,6 +71,22 @@ nonisolated struct JMAPSession: Decodable {
     /// server will accept in one request.
     var coreLimits: JMAPCapabilityProperties? {
         capabilities?["urn:ietf:params:jmap:core"]
+    }
+
+    /// Expands `uploadUrl` for one account. Same brace-encoding caveat as
+    /// `downloadURL`: `URL(string:)` percent-encodes the placeholder on decode.
+    func uploadURL(accountID: String) -> URL? {
+        guard let uploadURLTemplate else {
+            return nil
+        }
+
+        let encoded = accountID.addingPercentEncoding(withAllowedCharacters: .jmapTemplateValue) ?? ""
+        let expanded = uploadURLTemplate
+            .replacingOccurrences(of: "{accountId}", with: encoded)
+            .replacingOccurrences(of: "%7BaccountId%7D", with: encoded)
+            .replacingOccurrences(of: "%7baccountId%7d", with: encoded)
+
+        return URL(string: expanded)
     }
 
     var mailAccountID: String? {
@@ -139,6 +157,7 @@ nonisolated struct JMAPSession: Decodable {
         case apiURL = "apiUrl"
         case eventSourceURL = "eventSourceUrl"
         case downloadURLTemplate = "downloadUrl"
+        case uploadURLTemplate = "uploadUrl"
         case primaryAccounts
         case capabilities
         case accounts

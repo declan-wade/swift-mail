@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum ComposeWindow {
     static let id = "compose"
@@ -43,6 +44,9 @@ struct ComposeView: View {
     @State private var isSaving = false
     @State private var isConfirmingEmptySubject = false
     @State private var errorMessage: String?
+    @State private var isChoosingAttachments = false
+    @State private var isAttaching = false
+    @State private var isDropTargeted = false
     @State private var statusMessage: String?
     @Environment(\.dismiss) private var dismiss
 
@@ -58,8 +62,34 @@ struct ComposeView: View {
 
             Divider()
 
+            if !draft.attachments.isEmpty || isAttaching {
+                AttachmentStrip(
+                    attachments: draft.attachments,
+                    isAttaching: isAttaching,
+                    onRemove: { attachment in
+                        draft.attachments.removeAll { $0.id == attachment.id }
+                    }
+                )
+
+                Divider()
+            }
+
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // `URL` is what Finder and Mail put on the pasteboard, and
+                // SwiftUI's own drop handling saves reimplementing NSDraggingInfo.
+                .dropDestination(for: URL.self) { urls, _ in
+                    Task { await attach(urls) }
+                    return true
+                } isTargeted: { isDropTargeted = $0 }
+                .overlay {
+                    if isDropTargeted {
+                        RoundedRectangle(cornerRadius: Theme.Radius.medium)
+                            .strokeBorder(Color.accentColor, lineWidth: 2)
+                            .padding(Theme.Spacing.sm)
+                            .allowsHitTesting(false)
+                    }
+                }
 
             Divider()
 
@@ -69,15 +99,28 @@ struct ComposeView: View {
         // Two panes need room to be worth having; the window grows to meet it.
         .frame(minWidth: layout == .split ? 900 : 560, minHeight: 440)
         .background {
-            // ⇧⌘P keeps its old meaning — flip between writing and previewing,
+            // ⇧⌘P keeps its old meaning: flip between writing and previewing,
             // returning to the editor from either layout that shows a preview.
-            // It lives here rather than in the toolbar because a hidden
-            // `ToolbarItem` still reserves its slot and draws an empty capsule.
+            // It has no toolbar item of its own — the layout picker is the
+            // visible control — and a hidden `ToolbarItem` would still reserve
+            // its slot and draw an empty capsule, so it lives here instead.
             Button("Toggle Preview") {
                 layout = layout == .editor ? .preview : .editor
             }
             .keyboardShortcut("p", modifiers: [.command, .shift])
             .hidden()
+        }
+        .fileImporter(
+            isPresented: $isChoosingAttachments,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            switch result {
+            case .success(let urls):
+                Task { await attach(urls) }
+            case .failure(let error):
+                errorMessage = error.localizedDescription
+            }
         }
         .task(id: draft.markdown) {
             try? await Task.sleep(for: .milliseconds(400))
@@ -115,6 +158,61 @@ struct ComposeView: View {
         } message: {
             Text(errorMessage ?? "")
         }
+    }
+
+    /// Uploads dropped or chosen files, skipping directories and reporting the
+    /// first failure rather than silently attaching a partial set.
+    private func attach(_ urls: [URL]) async {
+        guard !urls.isEmpty else {
+            return
+        }
+
+        isAttaching = true
+        defer { isAttaching = false }
+
+        for url in urls {
+            do {
+                guard let file = try Self.readFile(at: url) else {
+                    continue
+                }
+
+                let attachment = try await store.uploadAttachment(
+                    data: file.data,
+                    name: url.lastPathComponent,
+                    type: file.type
+                )
+
+                // A file dropped twice is one attachment, not two.
+                if !draft.attachments.contains(where: { $0.blobId == attachment.blobId }) {
+                    draft.attachments.append(attachment)
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+                return
+            }
+        }
+    }
+
+    /// Reads a user-selected file. Sandboxed builds only reach outside the
+    /// container through a security-scoped URL, which has to be opened and
+    /// closed around the read.
+    private static func readFile(at url: URL) throws -> (data: Data, type: String)? {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer {
+            if scoped {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
+        guard values?.isDirectory != true else {
+            return nil
+        }
+
+        let type = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+            ?? "application/octet-stream"
+
+        return (try Data(contentsOf: url), type)
     }
 
     @ViewBuilder
@@ -178,6 +276,17 @@ struct ComposeView: View {
             .help("Editor, side by side, or preview")
         }
 
+
+        ToolbarItem {
+            Button {
+                isChoosingAttachments = true
+            } label: {
+                Label("Attach Files", systemImage: "paperclip")
+            }
+            .help("Attach Files (⇧⌘A)")
+            .keyboardShortcut("a", modifiers: [.command, .shift])
+            .disabled(isAttaching)
+        }
 
         ToolbarSpacer(.flexible)
 
@@ -357,6 +466,65 @@ private struct ComposeFieldRow<Content: View>: View {
 }
 
 // MARK: - Status bar
+
+/// The attached files, listed above the editor the way Mail shows them.
+private struct AttachmentStrip: View {
+    let attachments: [ComposeAttachment]
+    let isAttaching: Bool
+    let onRemove: (ComposeAttachment) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: Theme.Spacing.sm) {
+                ForEach(attachments) { attachment in
+                    HStack(spacing: Theme.Spacing.xs) {
+                        Image(systemName: icon(for: attachment))
+                            .foregroundStyle(.secondary)
+
+                        Text(attachment.name)
+                            .lineLimit(1)
+
+                        Text(attachment.sizeDescription)
+                            .foregroundStyle(.secondary)
+
+                        Button {
+                            onRemove(attachment)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.tertiary)
+                        .help("Remove \(attachment.name)")
+                    }
+                    .font(.callout)
+                    .padding(.horizontal, Theme.Spacing.sm)
+                    .padding(.vertical, Theme.Spacing.xs)
+                    .background(.quaternary, in: Capsule())
+                }
+
+                if isAttaching {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(.horizontal, Theme.Spacing.xs)
+                }
+            }
+            .padding(.horizontal, Theme.Spacing.lg)
+            .padding(.vertical, Theme.Spacing.sm)
+        }
+        .scrollIndicators(.never)
+    }
+
+    private func icon(for attachment: ComposeAttachment) -> String {
+        UTType(mimeType: attachment.type).map { type in
+            if type.conforms(to: .image) { return "photo" }
+            if type.conforms(to: .pdf) { return "doc.richtext" }
+            if type.conforms(to: .archive) { return "doc.zipper" }
+            if type.conforms(to: .movie) { return "film" }
+            if type.conforms(to: .audio) { return "waveform" }
+            return "doc"
+        } ?? "doc"
+    }
+}
 
 private struct ComposeStatusBar: View {
     let markdown: String

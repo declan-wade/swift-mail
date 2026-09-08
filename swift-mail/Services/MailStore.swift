@@ -664,6 +664,32 @@ final class MailStore: ObservableObject {
         return moved
     }
 
+    // MARK: - Attachments
+
+    /// Uploads one file and returns it ready to attach. Throws rather than
+    /// reporting through `errorMessage` so the compose window — which owns its
+    /// own draft and its own error surface — decides how to tell the user.
+    func uploadAttachment(data: Data, name: String, type: String) async throws -> ComposeAttachment {
+        guard let client = makeClient(), let session, let accountID else {
+            throw JMAPError.missingMailAccount
+        }
+
+        // The server states its own ceiling; refusing here beats a failed
+        // upload after pushing the whole file over the wire.
+        if let limit = session.coreLimits?.maxSizeUpload, data.count > limit {
+            throw JMAPError.attachmentTooLarge(name, limit)
+        }
+
+        let blob = try await client.uploadBlob(session: session, accountID: accountID, data: data, type: type)
+
+        return ComposeAttachment(
+            blobId: blob.blobId,
+            name: name,
+            type: blob.type ?? type,
+            size: blob.size ?? data.count
+        )
+    }
+
     // MARK: - Compose
 
     /// Identities are optional: an account without submission support can still

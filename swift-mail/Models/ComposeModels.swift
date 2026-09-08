@@ -44,6 +44,25 @@ nonisolated enum ComposeMode: String, Codable, Hashable {
     }
 }
 
+/// A file already uploaded to the server and ready to be referenced by blob id
+/// when the message is created.
+///
+/// Only uploaded files get this far: an attachment that failed to upload is
+/// reported and dropped rather than sitting in the draft in a broken state, so
+/// there is no "pending" case to reason about at send time.
+nonisolated struct ComposeAttachment: Identifiable, Hashable, Codable {
+    let blobId: String
+    let name: String
+    let type: String
+    let size: Int
+
+    var id: String { blobId }
+
+    var sizeDescription: String {
+        Int64(size).formatted(.byteCount(style: .file))
+    }
+}
+
 /// Everything a compose window needs to restore itself.
 ///
 /// This is the value carried by the compose `WindowGroup`, so it has to stay
@@ -71,6 +90,7 @@ nonisolated struct ComposeDraft: Identifiable, Hashable, Codable {
     var sourceDraftID: String?
     /// Persisted so a reopened window keeps the fields the user revealed.
     var showsCarbonCopy = false
+    var attachments: [ComposeAttachment] = []
 
     var hasRecipients: Bool {
         !(to.isEmpty && cc.isEmpty && bcc.isEmpty)
@@ -118,6 +138,21 @@ nonisolated extension ComposeDraft {
         )
 
         draft.sourceDraftID = email.id
+        // The blobs are already on the server, so a resumed draft keeps its
+        // attachments without re-uploading anything.
+        draft.attachments = email.listedAttachments.compactMap { attachment in
+            guard let blobId = attachment.blobId else {
+                return nil
+            }
+
+            return ComposeAttachment(
+                blobId: blobId,
+                name: attachment.displayName,
+                type: attachment.type ?? "application/octet-stream",
+                size: attachment.size ?? 0
+            )
+        }
+
         return draft
     }
 
