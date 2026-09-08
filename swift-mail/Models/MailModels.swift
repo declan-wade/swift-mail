@@ -209,8 +209,8 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
     /// the Inbox, and recent. The recency guard keeps a reconnect after a long
     /// offline stretch — where `Email/changes` can report a backlog of older
     /// messages as "created" — from firing a burst of stale notifications.
-    func warrantsNotification(inboxMailboxID: String, now: Date = Date(), maxAge: TimeInterval = 3600) -> Bool {
-        guard isUnread, mailboxIds?[inboxMailboxID] == true else {
+    func warrantsNotification(mailboxID: String, now: Date = Date(), maxAge: TimeInterval = 3600) -> Bool {
+        guard isUnread, mailboxIds?[mailboxID] == true else {
             return false
         }
 

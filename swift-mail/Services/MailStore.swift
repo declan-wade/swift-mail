@@ -3,6 +3,37 @@ import SwiftUI
 import Combine
 import AppKit
 
+/// Which mailboxes post a local notification when new mail lands in them.
+///
+/// Fastmail's server-side rules file mail straight into folders, and JMAP
+/// exposes no per-mailbox "notify me" flag, so the choice is kept locally as a
+/// comma-separated list of mailbox ids. The Inbox is seeded on first run;
+/// after that an empty list genuinely means "notify me about nothing".
+nonisolated enum NotifyingMailboxes {
+    static let storageKey = "swift-mail.notifyingMailboxIDs"
+
+    static func ids(in list: String) -> Set<String> {
+        Set(list.split(separator: ",").compactMap { $0.trimmingCharacters(in: .whitespaces).nilIfEmpty })
+    }
+
+    static func list(from ids: Set<String>) -> String {
+        ids.sorted().joined(separator: ",")
+    }
+
+    static var current: Set<String> {
+        ids(in: UserDefaults.standard.string(forKey: storageKey) ?? "")
+    }
+
+    /// First launch only: match what the app did before this setting existed.
+    static func seedIfNeeded(inboxID: String?, defaults: UserDefaults = .standard) {
+        guard defaults.string(forKey: storageKey) == nil, let inboxID else {
+            return
+        }
+
+        defaults.set(inboxID, forKey: storageKey)
+    }
+}
+
 @MainActor
 final class MailStore: ObservableObject {
     @Published var account: MailAccount?
@@ -147,6 +178,7 @@ final class MailStore: ObservableObject {
             self.session = session
             self.accountID = accountID
             self.mailboxes = mailboxes
+            NotifyingMailboxes.seedIfNeeded(inboxID: mailboxes.first { $0.role == "inbox" }?.id)
             updateDockBadge()
 
             let inboxID = mailboxes.first { $0.role == "inbox" }?.id ?? mailboxes.first?.id
@@ -720,6 +752,7 @@ final class MailStore: ObservableObject {
         do {
             mailboxes = try await client.fetchMailboxes(session: session, accountID: accountID)
             mailboxState = newState
+            NotifyingMailboxes.seedIfNeeded(inboxID: mailboxes.first { $0.role == "inbox" }?.id)
             updateDockBadge()
         } catch {
             backgroundErrorMessage = error.localizedDescription
@@ -826,15 +859,19 @@ final class MailStore: ObservableObject {
             emails.insert(contentsOf: additions, at: 0)
         }
 
-        // Notifications: only new, unread, recent Inbox mail.
-        if let inboxID {
+        // Notifications: new, unread, recent mail in any mailbox the user has
+        // switched on in Settings. Grouped per mailbox so the notification can
+        // name the folder the message was filed into.
+        let notifying = NotifyingMailboxes.current
+        for mailbox in mailboxes where notifying.contains(mailbox.id) {
             let notifiable = previews.filter {
-                createdIDs.contains($0.id) && $0.warrantsNotification(inboxMailboxID: inboxID)
+                createdIDs.contains($0.id) && $0.warrantsNotification(mailboxID: mailbox.id)
             }
 
             if !notifiable.isEmpty {
+                let name = mailbox.displayName
                 Task {
-                    await notificationService.notifyNewMessages(notifiable, mailboxName: "Inbox")
+                    await notificationService.notifyNewMessages(notifiable, mailboxName: name)
                 }
             }
         }

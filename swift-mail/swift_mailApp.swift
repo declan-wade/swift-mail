@@ -27,6 +27,10 @@ struct swift_mailApp: App {
             ComposeView(store: store, draft: draft ?? .blank(identity: store.defaultIdentity))
         }
         .defaultSize(width: 760, height: 620)
+
+        Settings {
+            SettingsView(store: store)
+        }
     }
 }
 

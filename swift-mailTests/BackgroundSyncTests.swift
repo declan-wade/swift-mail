@@ -8,6 +8,23 @@ import Testing
 @testable import swift_mail
 
 struct BackgroundSyncTests {
+
+    @Test("Notifying mailboxes seed to the Inbox once, then honour an empty list")
+    func notifyingMailboxSeeding() throws {
+        let defaults = try #require(UserDefaults(suiteName: "notifying-\(UUID().uuidString)"))
+
+        NotifyingMailboxes.seedIfNeeded(inboxID: "inbox-1", defaults: defaults)
+        #expect(defaults.string(forKey: NotifyingMailboxes.storageKey) == "inbox-1")
+
+        // The user turns everything off: that must survive the next launch.
+        defaults.set("", forKey: NotifyingMailboxes.storageKey)
+        NotifyingMailboxes.seedIfNeeded(inboxID: "inbox-1", defaults: defaults)
+        #expect(defaults.string(forKey: NotifyingMailboxes.storageKey) == "")
+
+        #expect(NotifyingMailboxes.ids(in: "a,b") == ["a", "b"])
+        #expect(NotifyingMailboxes.ids(in: "") == [])
+        #expect(NotifyingMailboxes.list(from: ["b", "a"]) == "a,b")
+    }
     private func decodePreview(_ json: String) throws -> EmailPreview {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -46,7 +63,7 @@ struct BackgroundSyncTests {
         }
         """)
 
-        #expect(preview.warrantsNotification(inboxMailboxID: "inbox-1", now: now))
+        #expect(preview.warrantsNotification(mailboxID: "inbox-1", now: now))
     }
 
     @Test("Already-read, non-Inbox, or stale messages do not notify")
@@ -56,12 +73,12 @@ struct BackgroundSyncTests {
         let read = try decodePreview("""
         { "id": "E2", "mailboxIds": { "inbox-1": true }, "keywords": { "$seen": true } }
         """)
-        #expect(!read.warrantsNotification(inboxMailboxID: "inbox-1", now: now))
+        #expect(!read.warrantsNotification(mailboxID: "inbox-1", now: now))
 
         let elsewhere = try decodePreview("""
         { "id": "E3", "mailboxIds": { "archive-1": true }, "keywords": {} }
         """)
-        #expect(!elsewhere.warrantsNotification(inboxMailboxID: "inbox-1", now: now))
+        #expect(!elsewhere.warrantsNotification(mailboxID: "inbox-1", now: now))
 
         let stale = try decodePreview("""
         {
@@ -71,7 +88,7 @@ struct BackgroundSyncTests {
             "receivedAt": "\(ISO8601DateFormatter().string(from: now.addingTimeInterval(-7200)))"
         }
         """)
-        #expect(!stale.warrantsNotification(inboxMailboxID: "inbox-1", now: now))
+        #expect(!stale.warrantsNotification(mailboxID: "inbox-1", now: now))
     }
 
     @Test("threadId decodes and survives a keyword edit")
