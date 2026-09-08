@@ -14,7 +14,21 @@ struct EmailListView: View {
         content
             .navigationTitle(store.selectedMailbox?.displayName ?? "Inbox")
             .navigationSplitViewColumnWidth(min: Theme.Column.list.min, ideal: Theme.Column.list.ideal)
-            .searchable(text: searchBinding, prompt: "Search This Mailbox")
+            .searchable(text: searchBinding, prompt: "Search — try from: subject: after:")
+            .searchSuggestions {
+                ForEach(store.searchSuggestions) { suggestion in
+                    HStack {
+                        Text(suggestion.label)
+                            .fontWeight(.medium)
+
+                        if !suggestion.detail.isEmpty {
+                            Text(suggestion.detail)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .searchCompletion(suggestion.completion)
+                }
+            }
             .onChange(of: store.selectedEmailID) { _, emailID in
                 guard let emailID else {
                     return

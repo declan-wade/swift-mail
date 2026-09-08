@@ -179,14 +179,10 @@ final class JMAPClient {
         mailboxID: String,
         position: Int = 0,
         limit: Int = 50,
-        searchText: String? = nil
+        searchFilter: [String: Any]? = nil
     ) async throws -> EmailPreviewPage {
         let properties = Self.previewProperties
-
-        var filter: [String: Any] = ["inMailbox": mailboxID]
-        if let searchText = searchText?.trimmingCharacters(in: .whitespacesAndNewlines), !searchText.isEmpty {
-            filter["text"] = searchText
-        }
+        let filter = searchFilter ?? ["inMailbox": mailboxID]
 
         let response = try await call(
             apiURL: session.apiURL,
@@ -687,6 +683,9 @@ nonisolated enum JMAPCapability {
     static let core = "urn:ietf:params:jmap:core"
     static let mailURN = "urn:ietf:params:jmap:mail"
     static let submissionURN = "urn:ietf:params:jmap:submission"
+    /// draft-ietf-extra-email-snooze, expired and undocumented by Fastmail —
+    /// checked at runtime rather than assumed.
+    static let snoozeURN = "urn:ietf:params:jmap:mail:snooze"
 
     static let mail = [core, mailURN]
     /// Submission requests still touch `Email` objects, so mail comes along.

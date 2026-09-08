@@ -13,6 +13,8 @@ nonisolated struct JMAPSession: Decodable {
     /// `URL` percent-encodes the `{}` placeholders on decode.
     let downloadURLTemplate: String?
     let primaryAccounts: [String: String]
+    /// Optional so a server that omits it still logs in; RFC 8620 2 requires it.
+    let capabilities: [String: JMAPCapabilityProperties]?
 
     /// Expands `downloadUrl` for one blob. Every value is percent-encoded, so
     /// an attachment named `../../etc` can only ever be one path segment.
@@ -38,6 +40,16 @@ nonisolated struct JMAPSession: Decodable {
         }
 
         return URL(string: expanded)
+    }
+
+    /// The extensions this server advertises. Only the URNs matter to us — a
+    /// capability's own settings object is read where that feature is used.
+    var capabilityURNs: Set<String> {
+        Set((capabilities ?? [:]).keys)
+    }
+
+    func supports(_ capability: String) -> Bool {
+        capabilityURNs.contains(capability)
     }
 
     var mailAccountID: String? {
@@ -103,7 +115,15 @@ nonisolated struct JMAPSession: Decodable {
         case eventSourceURL = "eventSourceUrl"
         case downloadURLTemplate = "downloadUrl"
         case primaryAccounts
+        case capabilities
     }
+}
+
+/// A capability's settings object, which this client doesn't inspect. Decoding
+/// ignores the value entirely so an unfamiliar shape can never fail the session
+/// decode and lock the user out of an otherwise working account.
+nonisolated struct JMAPCapabilityProperties: Decodable {
+    init(from decoder: Decoder) {}
 }
 
 private extension CharacterSet {

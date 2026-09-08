@@ -75,7 +75,7 @@ final class MailStore: ObservableObject {
     @Published var searchText = ""
     @Published var hasMoreEmails = false
 
-    private var session: JMAPSession?
+    @Published private var session: JMAPSession?
     private var accountID: String?
     private var bearerToken: String?
     private var autoFetchTask: Task<Void, Never>?
@@ -99,10 +99,35 @@ final class MailStore: ObservableObject {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// The active query as a JMAP filter, scoped to `mailboxID` unless the
+    /// query says otherwise with `in:`.
+    private func searchFilter(mailboxID: Mailbox.ID) -> [String: Any]? {
+        guard let activeSearch else {
+            return nil
+        }
+
+        return SearchQuery(activeSearch).jmapFilter(mailboxID: mailboxID, mailboxes: mailboxes)
+    }
+
+    /// Autocomplete for the search field, derived from the mailboxes and
+    /// messages already loaded.
+    var searchSuggestions: [SearchQuery.Suggestion] {
+        SearchQuery.suggestions(for: searchText, mailboxes: mailboxes, emails: emails)
+    }
+
     private let accountStorageKey = "swift-mail.account"
 
     var selectedMailbox: Mailbox? {
         mailboxes.first { $0.id == selectedMailboxID }
+    }
+
+    /// Capability URNs the connected server advertises, for the Settings list.
+    var serverCapabilities: [String] {
+        session?.capabilityURNs.sorted() ?? []
+    }
+
+    var supportsSnooze: Bool {
+        session?.supports(JMAPCapability.snoozeURN) ?? false
     }
 
     var hasConfiguredAccount: Bool {
@@ -228,8 +253,6 @@ final class MailStore: ObservableObject {
         detailErrorMessage = nil
         hasMoreEmails = false
 
-        let search = activeSearch
-
         do {
             let page = try await client.fetchEmailPreviews(
                 session: session,
@@ -237,7 +260,7 @@ final class MailStore: ObservableObject {
                 mailboxID: mailboxID,
                 position: 0,
                 limit: emailPageSize,
-                searchText: search
+                searchFilter: searchFilter(mailboxID: mailboxID)
             )
 
             emails = page.previews
@@ -278,7 +301,7 @@ final class MailStore: ObservableObject {
                 mailboxID: mailboxID,
                 position: nextPosition,
                 limit: emailPageSize,
-                searchText: search
+                searchFilter: searchFilter(mailboxID: mailboxID)
             )
 
             // Guard against a mailbox/search switch that landed mid-request.

@@ -38,6 +38,27 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section {
+                if store.serverCapabilities.isEmpty {
+                    Text("Connect an account to see what the server supports.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(store.serverCapabilities, id: \.self) { capability in
+                        Text(capability)
+                            .font(.callout.monospaced())
+                            .textSelection(.enabled)
+                    }
+                }
+            } header: {
+                Text("Server Capabilities")
+            } footer: {
+                Text(store.serverCapabilities.isEmpty
+                     ? "The JMAP extensions the server advertises."
+                     : "Snooze (\(JMAPCapability.snoozeURN)) is \(store.supportsSnooze ? "advertised" : "not advertised") by this server.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .frame(width: 440, height: 540)
