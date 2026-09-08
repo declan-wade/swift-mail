@@ -510,7 +510,11 @@ final class JMAPClient {
     /// The body is always `multipart/alternative`: the Markdown source ships as
     /// the text part, so recipients on plain-text clients read what the author
     /// actually typed rather than a lossy downgrade of the rendered HTML.
-    private static func emailObject(
+    ///
+    /// The body parts carry no `charset`: RFC 8621 4.6 says it MUST be omitted
+    /// when a `partId` is given, and Fastmail enforces that with
+    /// `invalidProperties`, which rejected every send.
+    static func emailObject(
         draft: ComposeDraft,
         identity: MailIdentity,
         mailboxIDs: [String: Bool],
@@ -524,8 +528,8 @@ final class JMAPClient {
             "bodyStructure": [
                 "type": "multipart/alternative",
                 "subParts": [
-                    ["partId": "text", "type": "text/plain", "charset": "utf-8"],
-                    ["partId": "html", "type": "text/html", "charset": "utf-8"]
+                    ["partId": "text", "type": "text/plain"],
+                    ["partId": "html", "type": "text/html"]
                 ]
             ],
             "bodyValues": [
@@ -577,6 +581,10 @@ final class JMAPClient {
         let detail = rejected.values
             .compactMap { ($0 as? [String: Any])?["description"] as? String }
             .first
+            ?? rejected.values
+                .compactMap { ($0 as? [String: Any])?["properties"] as? [String] }
+                .first
+                .map { $0.joined(separator: ", ") }
 
         let type = rejected.values
             .compactMap { ($0 as? [String: Any])?["type"] as? String }

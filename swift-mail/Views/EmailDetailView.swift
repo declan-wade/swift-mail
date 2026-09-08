@@ -1,9 +1,42 @@
 import SwiftUI
 
+/// Sender domains whose messages always render remote content.
+///
+/// Stored as one comma-separated string so the whole feature is an
+/// `@AppStorage` line rather than a store: matching is exact, so
+/// "evil-fastmail.com" never rides in on "fastmail.com".
+enum SafeSenders {
+    static let storageKey = "swift-mail.safeSenderDomains"
+
+    static func domain(of address: String?) -> String? {
+        guard let domain = address?.split(separator: "@").last else {
+            return nil
+        }
+
+        return domain.lowercased().nilIfEmpty
+    }
+
+    static func contains(_ domain: String, in list: String) -> Bool {
+        domains(in: list).contains(domain.lowercased())
+    }
+
+    static func adding(_ domain: String, to list: String) -> String {
+        domains(in: list).union([domain.lowercased()]).sorted().joined(separator: ",")
+    }
+
+    private static func domains(in list: String) -> Set<String> {
+        Set(
+            list.split(separator: ",")
+                .compactMap { $0.trimmingCharacters(in: .whitespaces).lowercased().nilIfEmpty }
+        )
+    }
+}
+
 struct EmailDetailView: View {
     @ObservedObject var store: MailStore
     /// Per-message: remote images stay blocked until the reader asks for them.
     @State private var loadsRemoteContent = false
+    @AppStorage(SafeSenders.storageKey) private var safeSenderDomains = ""
 
     var body: some View {
         content
@@ -39,17 +72,23 @@ struct EmailDetailView: View {
     }
 
     private func reader(for email: EmailDetail) -> some View {
-        VStack(spacing: 0) {
+        let domain = SafeSenders.domain(of: email.from?.first?.email)
+        let loadsRemote = loadsRemoteContent
+            || (domain.map { SafeSenders.contains($0, in: safeSenderDomains) } ?? false)
+
+        return VStack(spacing: 0) {
             ReaderHeader(
                 email: email,
                 store: store,
-                showsRemoteContentNotice: email.htmlBodyLoadsRemoteContent && !loadsRemoteContent,
-                onLoadRemoteContent: { loadsRemoteContent = true }
+                showsRemoteContentNotice: email.htmlBodyLoadsRemoteContent && !loadsRemote,
+                onLoadRemoteContent: { loadsRemoteContent = true },
+                senderDomain: domain,
+                onTrustSenderDomain: { safeSenderDomains = SafeSenders.adding($0, to: safeSenderDomains) }
             )
 
             Divider()
 
-            HTMLMessageView(html: email.htmlDocument, blocksRemoteContent: !loadsRemoteContent)
+            HTMLMessageView(html: email.htmlDocument, blocksRemoteContent: !loadsRemote)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .id(email.id)
         }
@@ -89,6 +128,8 @@ private struct ReaderHeader: View {
     @ObservedObject var store: MailStore
     var showsRemoteContentNotice = false
     var onLoadRemoteContent: () -> Void = {}
+    var senderDomain: String?
+    var onTrustSenderDomain: (String) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
@@ -137,7 +178,11 @@ private struct ReaderHeader: View {
             }
 
             if showsRemoteContentNotice {
-                RemoteContentNotice(action: onLoadRemoteContent)
+                RemoteContentNotice(
+                    action: onLoadRemoteContent,
+                    senderDomain: senderDomain,
+                    trustAction: onTrustSenderDomain
+                )
             }
         }
         .padding(.horizontal, Theme.Spacing.xxl)
@@ -150,6 +195,8 @@ private struct ReaderHeader: View {
 
 private struct RemoteContentNotice: View {
     let action: () -> Void
+    var senderDomain: String?
+    var trustAction: (String) -> Void = { _ in }
 
     var body: some View {
         HStack(spacing: Theme.Spacing.sm) {
@@ -176,6 +223,13 @@ private struct RemoteContentNotice: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             Spacer(minLength: Theme.Spacing.sm)
+
+            if let senderDomain {
+                Button("Add \(senderDomain) to Safe Senders") { trustAction(senderDomain) }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Always load remote content from \(senderDomain).")
+            }
 
             Button("Load Images", action: action)
                 .buttonStyle(.bordered)

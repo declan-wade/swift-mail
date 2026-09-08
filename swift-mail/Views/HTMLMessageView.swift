@@ -87,8 +87,14 @@ struct HTMLMessageView: NSViewRepresentable {
     /// `drawsBackground` KVC key, which `WKWebView` doesn't declare publicly —
     /// an SDK update could turn that into an `NSUnknownKeyException` crash the
     /// moment any message is opened.
+    ///
+    /// The opaque page also forces a light `appearance`: `prefers-color-scheme`
+    /// follows the view's appearance, not the page's `color-scheme`, so in a
+    /// dark app the message's own dark-mode rules would paint light text onto
+    /// the forced white background.
     private func applyChrome(to webView: WKWebView) {
         webView.underPageBackgroundColor = chrome == .transparent ? .clear : .white
+        webView.appearance = chrome == .transparent ? nil : NSAppearance(named: .aqua)
     }
 
     func makeCoordinator() -> Coordinator {

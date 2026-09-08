@@ -3,6 +3,55 @@ import Testing
 @testable import swift_mail
 
 struct MailModelsTests {
+
+    @Test("Safe-sender matching is exact, case-insensitive, and additive")
+    func safeSenderList() {
+        #expect(SafeSenders.domain(of: "dwade@FASTMAIL.com") == "fastmail.com")
+        #expect(SafeSenders.domain(of: "not-an-address") == "not-an-address")
+        #expect(SafeSenders.domain(of: nil) == nil)
+
+        let list = SafeSenders.adding("Fastmail.com", to: "")
+
+        #expect(list == "fastmail.com")
+        #expect(SafeSenders.contains("fastmail.com", in: list))
+        #expect(SafeSenders.contains("FASTMAIL.COM", in: list))
+        // A lookalike domain must not match by substring.
+        #expect(SafeSenders.contains("evil-fastmail.com", in: list) == false)
+        #expect(SafeSenders.contains("mail.fastmail.com", in: list) == false)
+        // Adding is idempotent and keeps earlier entries.
+        #expect(SafeSenders.adding("fastmail.com", to: list) == list)
+        #expect(SafeSenders.adding("apple.com", to: list) == "apple.com,fastmail.com")
+    }
+
+    /// RFC 8621 4.6: a body part given a `partId` must not also carry
+    /// `charset`. Fastmail rejects the whole send with `invalidProperties`.
+    @Test("Draft body parts declare a partId and no charset")
+    func bodyPartsOmitCharset() throws {
+        let identity = MailIdentity(
+            id: "i1",
+            name: "Declan",
+            email: "dwade@fastmail.com",
+            replyTo: nil,
+            bcc: nil,
+            textSignature: nil,
+            htmlSignature: nil
+        )
+
+        let email = JMAPClient.emailObject(
+            draft: ComposeDraft(to: [EmailAddress(email: "someone@example.com")], subject: "Test", markdown: "hello"),
+            identity: identity,
+            mailboxIDs: ["drafts": true],
+            keywords: ["$draft": true]
+        )
+
+        let structure = try #require(email["bodyStructure"] as? [String: Any])
+        let subParts = try #require(structure["subParts"] as? [[String: Any]])
+
+        #expect(subParts.count == 2)
+        #expect(subParts.allSatisfy { $0["partId"] != nil })
+        #expect(subParts.allSatisfy { $0["charset"] == nil })
+        #expect(email["bodyValues"] != nil)
+    }
     private func decodeEmailDetail(_ json: String) throws -> EmailDetail {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
