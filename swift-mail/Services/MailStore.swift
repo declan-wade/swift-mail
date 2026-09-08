@@ -109,6 +109,31 @@ final class MailStore: ObservableObject {
         return SearchQuery(activeSearch).jmapFilter(mailboxID: mailboxID, mailboxes: mailboxes)
     }
 
+    func isActive(_ filter: SearchQuery.QuickFilter) -> Bool {
+        SearchQuery.contains(filter.rawValue, in: searchText)
+    }
+
+    /// Quick filters live in the search text itself, so they reuse the whole
+    /// existing query path — debounce, JMAP filter, paging — and stack with a
+    /// typed query rather than fighting it.
+    func toggle(_ filter: SearchQuery.QuickFilter) {
+        searchQueryChanged(SearchQuery.toggling(filter.rawValue, in: searchText))
+    }
+
+    var hasQuickFilter: Bool {
+        SearchQuery.QuickFilter.allCases.contains(where: isActive)
+    }
+
+    /// True when the query is *only* quick filters, so the empty state can say
+    /// "nothing matches" instead of quoting `is:unread` back at the user.
+    var isFilteredWithoutSearchTerms: Bool {
+        let tokens = SearchQuery.tokenize(searchText)
+
+        return !tokens.isEmpty && tokens.allSatisfy { token in
+            SearchQuery.QuickFilter.allCases.contains { $0.rawValue.caseInsensitiveCompare(token) == .orderedSame }
+        }
+    }
+
     /// Autocomplete for the search field, derived from the mailboxes and
     /// messages already loaded.
     var searchSuggestions: [SearchQuery.Suggestion] {

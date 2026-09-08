@@ -2,6 +2,7 @@ import SwiftUI
 
 struct EmailListView: View {
     @ObservedObject var store: MailStore
+    @Environment(\.openWindow) private var openWindow
 
     private var searchBinding: Binding<String> {
         Binding(
@@ -14,6 +15,7 @@ struct EmailListView: View {
         content
             .navigationTitle(store.selectedMailbox?.displayName ?? "Inbox")
             .navigationSplitViewColumnWidth(min: Theme.Column.list.min, ideal: Theme.Column.list.ideal)
+            .toolbar { listToolbar }
             .searchable(text: searchBinding, prompt: "Search — try from: subject: after:")
             .searchSuggestions {
                 ForEach(store.searchSuggestions) { suggestion in
@@ -38,6 +40,49 @@ struct EmailListView: View {
                     await store.loadEmailDetail(emailID: emailID)
                 }
             }
+    }
+
+    /// Lives on the content column, so these sit above the message list rather
+    /// than out in the reader's toolbar with the per-message actions.
+    @ToolbarContentBuilder
+    private var listToolbar: some ToolbarContent {
+        ToolbarItemGroup {
+            Button {
+                openWindow(id: ComposeWindow.id, value: ComposeDraft.blank(identity: store.defaultIdentity))
+            } label: {
+                Label("New Message", systemImage: "square.and.pencil")
+            }
+            .help("New Message (⌘N)")
+
+            Button {
+                Task { await store.refresh() }
+            } label: {
+                Label("Refresh", systemImage: "arrow.clockwise")
+            }
+            .help("Refresh (⇧⌘N)")
+            .keyboardShortcut("n", modifiers: [.command, .shift])
+            .disabled(store.isLoadingMailboxes || store.isLoadingEmails)
+
+            Menu {
+                ForEach(SearchQuery.QuickFilter.allCases) { filter in
+                    Toggle(isOn: Binding(
+                        get: { store.isActive(filter) },
+                        set: { _ in store.toggle(filter) }
+                    )) {
+                        Label(filter.label, systemImage: filter.icon)
+                    }
+                }
+            } label: {
+                Label(
+                    "Filter",
+                    systemImage: store.hasQuickFilter
+                        ? "line.3.horizontal.decrease.circle.fill"
+                        : "line.3.horizontal.decrease.circle"
+                )
+            }
+            .help("Filter Messages")
+            .disabled(store.selectedMailboxID == nil)
+        }
     }
 
     @ViewBuilder
@@ -69,6 +114,13 @@ struct EmailListView: View {
     private var emptyState: some View {
         if store.searchText.trimmingCharacters(in: .whitespaces).isEmpty {
             ContentUnavailableView("No Messages", systemImage: "tray")
+        } else if store.isFilteredWithoutSearchTerms {
+            // Quoting `is:unread` back at the user isn't an empty state.
+            ContentUnavailableView(
+                "No Matching Messages",
+                systemImage: "line.3.horizontal.decrease.circle",
+                description: Text("No messages in this folder match the active filter.")
+            )
         } else {
             ContentUnavailableView.search(text: store.searchText)
         }

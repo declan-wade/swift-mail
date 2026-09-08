@@ -85,6 +85,43 @@ struct SearchQueryTests {
         #expect(filter("from:") == nil || conditions("from:").allSatisfy { $0["text"] == nil })
     }
 
+    @Test("Toggling a quick filter adds and removes only its own token")
+    func quickFilterToggling() {
+        let unread = SearchQuery.QuickFilter.unread.rawValue
+
+        #expect(SearchQuery.toggling(unread, in: "") == "is:unread")
+        #expect(SearchQuery.toggling(unread, in: "budget") == "budget is:unread")
+        #expect(SearchQuery.toggling(unread, in: "budget is:unread") == "budget")
+        #expect(SearchQuery.toggling(unread, in: "is:unread has:attachment") == "has:attachment")
+
+        #expect(SearchQuery.contains(unread, in: "budget is:unread"))
+        #expect(!SearchQuery.contains(unread, in: "budget is:read"))
+        // A word merely containing the token isn't the token.
+        #expect(!SearchQuery.contains(unread, in: "subject:is:unread"))
+    }
+
+    @Test("Toggling round-trips a quoted phrase instead of splitting it")
+    func togglingPreservesQuotedPhrases() {
+        let toggled = SearchQuery.toggling("is:flagged", in: "subject:\"q3 report\" from:ana")
+
+        #expect(SearchQuery.tokenize(toggled) == ["subject:q3 report", "from:ana", "is:flagged"])
+
+        let conditions = (SearchQuery(toggled).jmapFilter(mailboxID: "mb", mailboxes: [])?["conditions"] as? [[String: Any]]) ?? []
+        #expect(conditions.contains { $0["subject"] as? String == "q3 report" })
+        #expect(conditions.contains { $0["hasKeyword"] as? String == "$flagged" })
+    }
+
+    @Test("Every quick filter maps to a real JMAP condition")
+    func quickFiltersProduceConditions() {
+        for filter in SearchQuery.QuickFilter.allCases {
+            let conditions = (SearchQuery(filter.rawValue)
+                .jmapFilter(mailboxID: "mb", mailboxes: [])?["conditions"] as? [[String: Any]]) ?? []
+
+            // The mailbox scope plus the filter's own condition.
+            #expect(conditions.count == 2, "\(filter.rawValue) produced \(conditions)")
+        }
+    }
+
     @Test("Suggestions complete operators and their values against the full query")
     func suggestions() {
         let fields = SearchQuery.suggestions(for: "budget su", mailboxes: mailboxes)

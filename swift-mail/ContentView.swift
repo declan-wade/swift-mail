@@ -163,26 +163,6 @@ private struct MailHomeView: View {
 
         ToolbarSpacer(.flexible)
 
-        ToolbarItemGroup {
-            Button {
-                compose(.blank(identity: store.defaultIdentity))
-            } label: {
-                Label("New Message", systemImage: "square.and.pencil")
-            }
-            .help("New Message (⌘N)")
-
-            Button {
-                Task {
-                    await store.refresh()
-                }
-            } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
-            }
-            .help("Refresh (⇧⌘N)")
-            .keyboardShortcut("n", modifiers: [.command, .shift])
-            .disabled(store.isLoadingMailboxes || store.isLoadingEmails)
-        }
-
         ToolbarItem {
             Menu {
                 Button("Remove Account", role: .destructive) {

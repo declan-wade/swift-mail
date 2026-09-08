@@ -247,6 +247,69 @@ nonisolated struct SearchQuery {
     ]
 }
 
+// MARK: - Quick filters
+
+extension SearchQuery {
+    /// The toolbar's one-click filters. Each is just an operator the search
+    /// field already understands, so a filter and a typed query compose
+    /// instead of competing, and neither needs its own query pipeline.
+    enum QuickFilter: String, CaseIterable, Identifiable {
+        case unread = "is:unread"
+        case flagged = "is:flagged"
+        case hasAttachment = "has:attachment"
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .unread: "Unread"
+            case .flagged: "Flagged"
+            case .hasAttachment: "Has Attachment"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .unread: "envelope.badge"
+            case .flagged: "flag"
+            case .hasAttachment: "paperclip"
+            }
+        }
+    }
+
+    static func contains(_ token: String, in query: String) -> Bool {
+        tokenize(query).contains { $0.caseInsensitiveCompare(token) == .orderedSame }
+    }
+
+    /// Adds or removes one operator token, leaving everything else the user
+    /// typed intact.
+    static func toggling(_ token: String, in query: String) -> String {
+        var tokens = tokenize(query)
+
+        if let index = tokens.firstIndex(where: { $0.caseInsensitiveCompare(token) == .orderedSame }) {
+            tokens.remove(at: index)
+        } else {
+            tokens.append(token)
+        }
+
+        return tokens.map(requoted).joined(separator: " ")
+    }
+
+    /// Re-quotes a token that holds whitespace, so rebuilding a query string
+    /// from its tokens round-trips back through `tokenize` unchanged.
+    private static func requoted(_ token: String) -> String {
+        guard token.contains(where: \.isWhitespace) else {
+            return token
+        }
+
+        guard let colon = token.firstIndex(of: ":") else {
+            return "\"\(token)\""
+        }
+
+        return token[...colon] + "\"" + token[token.index(after: colon)...] + "\""
+    }
+}
+
 // MARK: - Autocomplete
 
 extension SearchQuery {
