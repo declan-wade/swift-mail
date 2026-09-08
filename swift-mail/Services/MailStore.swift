@@ -74,6 +74,10 @@ final class MailStore: ObservableObject {
     /// The live search query. Empty means the plain mailbox listing.
     @Published var searchText = ""
     @Published var hasMoreEmails = false
+    /// Every message in the open message's conversation, oldest first. Holds a
+    /// single element for a message with no siblings, which the reader treats
+    /// as "no conversation to show".
+    @Published var conversation: [EmailPreview] = []
 
     @Published private var session: JMAPSession?
     private var accountID: String?
@@ -86,6 +90,10 @@ final class MailStore: ObservableObject {
     /// The message whose body is being fetched right now, so the same fetch
     /// isn't started twice concurrently.
     private var loadingDetailEmailID: EmailPreview.ID?
+    /// The conversation currently in `conversation`, so switching between
+    /// messages of the same thread doesn't refetch it.
+    private var loadedThreadID: String?
+    private var conversationTask: Task<Void, Never>?
     /// The last-seen server state per JMAP type, so background syncs ask the
     /// server only for what changed (`Email/changes`) instead of re-querying.
     private var emailState: String?
@@ -454,6 +462,8 @@ final class MailStore: ObservableObject {
             inlineImageCache.removeAll()
         }
 
+        loadConversation(for: emailID)
+
         selectedEmailID = emailID
         isLoadingSelectedEmail = true
         detailErrorMessage = nil
@@ -691,6 +701,44 @@ final class MailStore: ObservableObject {
         }
 
         return moved
+    }
+
+    // MARK: - Conversations
+
+    /// Loads the thread around `emailID`, if it isn't already loaded.
+    ///
+    /// Deliberately not awaited by `loadEmailDetail`: the body is what the
+    /// reader is waiting for, and the conversation strip can arrive a moment
+    /// later without holding it up.
+    private func loadConversation(for emailID: EmailPreview.ID) {
+        guard let threadID = emails.first(where: { $0.id == emailID })?.threadId
+            ?? conversation.first(where: { $0.id == emailID })?.threadId else {
+            conversation = []
+            loadedThreadID = nil
+            return
+        }
+
+        guard threadID != loadedThreadID else {
+            return
+        }
+
+        conversationTask?.cancel()
+        loadedThreadID = threadID
+        conversation = []
+
+        guard let client = makeClient(), let session, let accountID else {
+            return
+        }
+
+        conversationTask = Task { [weak self] in
+            let emails = try? await client.fetchThreadEmails(session: session, accountID: accountID, threadID: threadID)
+
+            guard let self, !Task.isCancelled, loadedThreadID == threadID else {
+                return
+            }
+
+            conversation = emails ?? []
+        }
     }
 
     // MARK: - Inline images

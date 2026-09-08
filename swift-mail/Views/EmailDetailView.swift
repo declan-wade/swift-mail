@@ -78,6 +78,11 @@ struct EmailDetailView: View {
             || (domain.map { SafeSenders.contains($0, in: safeSenderDomains) } ?? false)
 
         return VStack(spacing: 0) {
+            if store.conversation.count > 1 {
+                ConversationStrip(store: store, selectedID: email.id)
+                Divider()
+            }
+
             ReaderHeader(
                 email: email,
                 store: store,
@@ -125,6 +130,78 @@ private struct DraftPlaceholder: View {
             id: ComposeWindow.id,
             value: ComposeDraft.editDraft(from: email, identity: store.identity(id: nil))
         )
+    }
+}
+
+/// Every message in the open conversation, oldest first, with the one being
+/// read marked. Clicking a row moves the reader to that message.
+///
+/// A strip rather than the stacked, all-expanded layout Mimestream uses:
+/// stacking needs each message's rendered height, and the only way to get that
+/// out of a `WKWebView` is to run JavaScript in it — which this app disables on
+/// purpose for mail it did not author.
+private struct ConversationStrip: View {
+    @ObservedObject var store: MailStore
+    let selectedID: String
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal) {
+                HStack(spacing: Theme.Spacing.sm) {
+                    ForEach(Array(store.conversation.enumerated()), id: \.element.id) { index, message in
+                        Button {
+                            guard message.id != selectedID else { return }
+                            Task { await store.loadEmailDetail(emailID: message.id) }
+                        } label: {
+                            row(for: message, position: index + 1)
+                        }
+                        .buttonStyle(.plain)
+                        .id(message.id)
+                    }
+                }
+                .padding(.horizontal, Theme.Spacing.lg)
+                .padding(.vertical, Theme.Spacing.sm)
+            }
+            .scrollIndicators(.never)
+            .onChange(of: selectedID, initial: true) { _, id in
+                withAnimation(Theme.Motion.hover) { proxy.scrollTo(id, anchor: .center) }
+            }
+        }
+    }
+
+    private func row(for message: EmailPreview, position: Int) -> some View {
+        let isSelected = message.id == selectedID
+
+        return HStack(spacing: Theme.Spacing.xs) {
+            Text("\(position)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+
+            if message.isUnread {
+                Circle()
+                    .fill(Color.accentColor)
+                    .frame(width: Theme.Size.unreadDot, height: Theme.Size.unreadDot)
+            }
+
+            Text(message.senderLine)
+                .fontWeight(isSelected ? .semibold : .regular)
+                .lineLimit(1)
+
+            if let receivedAt = message.receivedAt {
+                Text(DateFormatter.mailShort.string(from: receivedAt))
+                    .foregroundStyle(.secondary)
+            }
+
+            if message.hasAttachment == true {
+                Image(systemName: "paperclip")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.callout)
+        .padding(.horizontal, Theme.Spacing.sm)
+        .padding(.vertical, Theme.Spacing.xs)
+        .background(isSelected ? AnyShapeStyle(.selection) : AnyShapeStyle(.quaternary), in: Capsule())
+        .help(message.subjectLine)
     }
 }
 

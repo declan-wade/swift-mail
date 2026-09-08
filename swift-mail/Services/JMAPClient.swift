@@ -310,6 +310,39 @@ final class JMAPClient {
         return Array((payload["notUpdated"] as? [String: Any])?.keys ?? [:].keys)
     }
 
+    /// Every message in one conversation, oldest first.
+    ///
+    /// `Thread/get` names the message ids and `Email/get` reads them in the same
+    /// request via a back-reference, so a conversation costs one round trip
+    /// rather than one per message.
+    func fetchThreadEmails(session: JMAPSession, accountID: String, threadID: String) async throws -> [EmailPreview] {
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                ["Thread/get", ["accountId": accountID, "ids": [threadID]], "thread"],
+                [
+                    "Email/get",
+                    [
+                        "accountId": accountID,
+                        "#ids": [
+                            "resultOf": "thread",
+                            "name": "Thread/get",
+                            "path": "/list/*/emailIds"
+                        ],
+                        "properties": Self.previewProperties
+                    ],
+                    "threadEmails"
+                ]
+            ]
+        )
+
+        let payload = try response.payload(named: "Email/get", clientID: "threadEmails")
+        let data = try JSONSerialization.data(withJSONObject: payload["list"] ?? [])
+        let emails = try decoder.decode([EmailPreview].self, from: data)
+
+        return emails.sorted { ($0.receivedAt ?? .distantPast) < ($1.receivedAt ?? .distantPast) }
+    }
+
     func fetchEmailDetail(session: JMAPSession, accountID: String, emailID: String) async throws -> EmailDetail {
         let response = try await call(
             apiURL: session.apiURL,
