@@ -371,6 +371,27 @@ final class JMAPClient {
         return try decoder.decode([MailIdentity].self, from: listData)
     }
 
+    /// Fetches one attachment's bytes from the session's `downloadUrl`.
+    func downloadBlob(session: JMAPSession, accountID: String, attachment: EmailAttachment) async throws -> Data {
+        guard let blobID = attachment.blobId,
+              let url = session.downloadURL(
+                  accountID: accountID,
+                  blobID: blobID,
+                  type: attachment.type,
+                  name: attachment.displayName
+              ) else {
+            throw JMAPError.missingDownloadURL
+        }
+
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await urlSession.data(for: request)
+        try validate(response: response, data: data)
+
+        return data
+    }
+
     /// Creates the draft in the Drafts mailbox and returns its new email ID.
     @discardableResult
     func createDraft(
@@ -680,6 +701,7 @@ enum JMAPError: LocalizedError {
     case methodError(String)
     case missingIdentity
     case missingMailAccount
+    case missingDownloadURL
     case missingMailbox(String)
     case missingMethodResponse(String)
     case setError(String, String?)
@@ -704,6 +726,8 @@ enum JMAPError: LocalizedError {
             return "No sending identity is available for this account."
         case .missingMailAccount:
             return "The JMAP session does not expose a mail account."
+        case .missingDownloadURL:
+            return "This attachment has no downloadable content."
         case .missingMailbox(let role):
             return "This account has no \(role) mailbox, so the message could not be filed."
         case .missingMethodResponse(let method):

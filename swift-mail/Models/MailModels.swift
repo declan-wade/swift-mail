@@ -9,7 +9,36 @@ nonisolated struct MailAccount: Codable, Equatable {
 nonisolated struct JMAPSession: Decodable {
     let apiURL: URL
     let eventSourceURL: URL?
+    /// Kept as the raw string: RFC 8620 6.2 defines it as a URI template, and
+    /// `URL` percent-encodes the `{}` placeholders on decode.
+    let downloadURLTemplate: String?
     let primaryAccounts: [String: String]
+
+    /// Expands `downloadUrl` for one blob. Every value is percent-encoded, so
+    /// an attachment named `../../etc` can only ever be one path segment.
+    func downloadURL(accountID: String, blobID: String, type: String?, name: String?) -> URL? {
+        guard let downloadURLTemplate else {
+            return nil
+        }
+
+        let values = [
+            "accountId": accountID,
+            "blobId": blobID,
+            "type": type ?? "application/octet-stream",
+            "name": name ?? "attachment"
+        ]
+
+        let expanded = values.reduce(downloadURLTemplate) { url, entry in
+            let encoded = entry.value.addingPercentEncoding(withAllowedCharacters: .jmapTemplateValue) ?? ""
+
+            return url
+                .replacingOccurrences(of: "{\(entry.key)}", with: encoded)
+                .replacingOccurrences(of: "%7B\(entry.key)%7D", with: encoded)
+                .replacingOccurrences(of: "%7b\(entry.key)%7d", with: encoded)
+        }
+
+        return URL(string: expanded)
+    }
 
     var mailAccountID: String? {
         primaryAccounts["urn:ietf:params:jmap:mail"]
@@ -72,8 +101,15 @@ nonisolated struct JMAPSession: Decodable {
     private enum CodingKeys: String, CodingKey {
         case apiURL = "apiUrl"
         case eventSourceURL = "eventSourceUrl"
+        case downloadURLTemplate = "downloadUrl"
         case primaryAccounts
     }
+}
+
+private extension CharacterSet {
+    /// Unreserved characters only (RFC 3986), so an expanded value can never
+    /// introduce a `/`, `?` or `#` and change the URL's shape.
+    static let jmapTemplateValue = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 }
 
 nonisolated struct Mailbox: Identifiable, Hashable, Decodable {

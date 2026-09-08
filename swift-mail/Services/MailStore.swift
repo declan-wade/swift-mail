@@ -409,7 +409,7 @@ final class MailStore: ObservableObject {
     /// window can report them inline instead of interrupting the main window.
     @discardableResult
     func saveDraft(_ draft: ComposeDraft) async throws -> String {
-        let context = try await composeContext()
+        let context = try await apiContext()
 
         guard let draftsMailboxID = mailbox(role: "drafts")?.id else {
             throw JMAPError.missingMailbox("Drafts")
@@ -452,7 +452,7 @@ final class MailStore: ObservableObject {
     }
 
     func send(_ draft: ComposeDraft) async throws {
-        let context = try await composeContext()
+        let context = try await apiContext()
 
         guard let draftsMailboxID = mailbox(role: "drafts")?.id else {
             throw JMAPError.missingMailbox("Drafts")
@@ -485,9 +485,84 @@ final class MailStore: ObservableObject {
         return identity
     }
 
+    // MARK: - Attachments
+
+    /// Downloads an attachment to a private temporary file, for Quick Look.
+    func previewFile(for attachment: EmailAttachment) async throws -> URL {
+        let data = try await attachmentData(attachment)
+        // A per-download directory keeps the real filename (Quick Look picks
+        // its previewer from the extension) without ever colliding.
+        let directory = URL.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let file = directory.appending(path: Self.safeFileName(for: attachment))
+        try data.write(to: file)
+
+        return file
+    }
+
+    /// Saves an attachment into ~/Downloads, numbering the name if it is taken.
+    @discardableResult
+    func saveToDownloads(_ attachment: EmailAttachment) async throws -> URL {
+        let data = try await attachmentData(attachment)
+        let downloads = try FileManager.default.url(
+            for: .downloadsDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+
+        let file = Self.uniqueURL(in: downloads, named: Self.safeFileName(for: attachment))
+        try data.write(to: file)
+
+        return file
+    }
+
+    private func attachmentData(_ attachment: EmailAttachment) async throws -> Data {
+        let context = try await apiContext()
+
+        return try await context.client.downloadBlob(
+            session: context.session,
+            accountID: context.accountID,
+            attachment: attachment
+        )
+    }
+
+    /// The sender picks the attachment name, so it is reduced to a single, plain
+    /// path component before it is ever joined to a directory.
+    nonisolated static func safeFileName(for attachment: EmailAttachment) -> String {
+        let component = (attachment.displayName as NSString).lastPathComponent
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return String(component.drop { $0 == "." }).nilIfEmpty ?? "attachment"
+    }
+
+    /// "report.pdf" taken becomes "report 2.pdf", then "report 3.pdf".
+    nonisolated static func uniqueURL(in directory: URL, named name: String, exists: (URL) -> Bool = { FileManager.default.fileExists(atPath: $0.path) }) -> URL {
+        let candidate = directory.appending(path: name)
+        guard exists(candidate) else {
+            return candidate
+        }
+
+        let base = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+
+        for suffix in 2...999 {
+            let numbered = ext.isEmpty ? "\(base) \(suffix)" : "\(base) \(suffix).\(ext)"
+            let url = directory.appending(path: numbered)
+            if !exists(url) {
+                return url
+            }
+        }
+
+        return directory.appending(path: "\(base) \(UUID().uuidString)\(ext.isEmpty ? "" : ".\(ext)")")
+    }
+
     /// Compose can be triggered before the first refresh has landed, so this
     /// establishes the session on demand rather than failing.
-    private func composeContext() async throws -> (client: JMAPClient, session: JMAPSession, accountID: String) {
+    private func apiContext() async throws -> (client: JMAPClient, session: JMAPSession, accountID: String) {
         if session == nil {
             await refresh()
         }

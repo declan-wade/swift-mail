@@ -4,6 +4,31 @@ import Testing
 
 struct MailModelsTests {
 
+    @Test("Attachment names are reduced to one safe path component")
+    func attachmentFileNames() {
+        func name(_ raw: String?) -> String {
+            MailStore.safeFileName(for: EmailAttachment(blobId: "b", type: nil, name: raw, size: nil, disposition: nil, cid: nil))
+        }
+
+        #expect(name("report.pdf") == "report.pdf")
+        #expect(name("../../../etc/passwd") == "passwd")
+        #expect(name("..") == "attachment")
+        #expect(name(".hidden") == "hidden")
+        #expect(name(nil) == "Attachment")
+        // A blank name never reaches the sanitiser: displayName falls back first.
+        #expect(name("  ") == "Attachment")
+    }
+
+    @Test("Saving numbers a name that is already taken")
+    func downloadNameCollisions() {
+        let directory = URL(filePath: "/Users/someone/Downloads")
+        let taken: Set<String> = ["report.pdf", "report 2.pdf"]
+        let url = MailStore.uniqueURL(in: directory, named: "report.pdf") { taken.contains($0.lastPathComponent) }
+
+        #expect(url.lastPathComponent == "report 3.pdf")
+        #expect(MailStore.uniqueURL(in: directory, named: "fresh.pdf") { taken.contains($0.lastPathComponent) }.lastPathComponent == "fresh.pdf")
+    }
+
     @Test("Safe-sender matching is exact, case-insensitive, and additive")
     func safeSenderList() {
         #expect(SafeSenders.domain(of: "dwade@FASTMAIL.com") == "fastmail.com")

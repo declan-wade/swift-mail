@@ -8,6 +8,37 @@ import Testing
 @testable import swift_mail
 
 struct JMAPSessionTests {
+
+    @Test("downloadUrl template expands and percent-encodes every value")
+    func downloadURLExpansion() throws {
+        let json = """
+        {
+            "apiUrl": "https://api.fastmail.com/jmap/api/",
+            "downloadUrl": "https://api.fastmail.com/jmap/download/{accountId}/{blobId}/{name}?type={type}",
+            "primaryAccounts": {}
+        }
+        """
+
+        let session = try JSONDecoder().decode(JMAPSession.self, from: Data(json.utf8))
+        let url = try #require(
+            session.downloadURL(accountID: "u1", blobID: "b1", type: "application/pdf", name: "../my report.pdf")
+        )
+
+        #expect(url.absoluteString == "https://api.fastmail.com/jmap/download/u1/b1/..%2Fmy%20report.pdf?type=application%2Fpdf")
+        // One path segment, no traversal.
+        #expect(url.pathComponents == ["/", "jmap", "download", "u1", "b1", "../my report.pdf"])
+    }
+
+    @Test("A session without downloadUrl yields no download URL")
+    func downloadURLMissing() throws {
+        let json = """
+        { "apiUrl": "https://api.fastmail.com/jmap/api/", "primaryAccounts": {} }
+        """
+
+        let session = try JSONDecoder().decode(JMAPSession.self, from: Data(json.utf8))
+
+        #expect(session.downloadURL(accountID: "u1", blobID: "b1", type: nil, name: nil) == nil)
+    }
     private func makeSession(eventSourceURL: URL?) -> JMAPSession {
         let eventSourceField = eventSourceURL.map { "\"\($0.absoluteString)\"" } ?? "null"
         let json = """

@@ -1,3 +1,4 @@
+import QuickLook
 import SwiftUI
 
 /// Sender domains whose messages always render remote content.
@@ -174,7 +175,7 @@ private struct ReaderHeader: View {
             }
 
             if !email.listedAttachments.isEmpty {
-                AttachmentList(attachments: email.listedAttachments)
+                AttachmentList(attachments: email.listedAttachments, store: store)
             }
 
             if showsRemoteContentNotice {
@@ -242,6 +243,11 @@ private struct RemoteContentNotice: View {
 
 private struct AttachmentList: View {
     let attachments: [EmailAttachment]
+    @ObservedObject var store: MailStore
+    /// Quick Look handles the file types itself — PDFs, images, text, Office
+    /// documents — so there is no per-type preview code here.
+    @State private var previewURL: URL?
+    @State private var busyID: EmailAttachment.ID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
@@ -251,22 +257,76 @@ private struct AttachmentList: View {
 
             FlowLayout(spacing: Theme.Spacing.sm) {
                 ForEach(attachments) { attachment in
-                    HStack(spacing: Theme.Spacing.xs) {
-                        Image(systemName: "doc")
-                        Text(attachment.displayName)
-                            .lineLimit(1)
-                        if let size = attachment.sizeDescription {
-                            Text(size)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .font(.callout)
-                    .padding(.horizontal, Theme.Spacing.sm)
-                    .padding(.vertical, Theme.Spacing.xs)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: Theme.Radius.small))
+                    AttachmentChip(
+                        attachment: attachment,
+                        isBusy: busyID == attachment.id,
+                        onPreview: { run(attachment) { previewURL = try await store.previewFile(for: $0) } },
+                        onSave: { run(attachment) { try await store.saveToDownloads($0) } }
+                    )
                 }
             }
         }
+        .quickLookPreview($previewURL)
+    }
+
+    /// Both actions download first, so they share the spinner and the alert.
+    private func run(_ attachment: EmailAttachment, action: @escaping (EmailAttachment) async throws -> Void) {
+        guard busyID == nil else {
+            return
+        }
+
+        busyID = attachment.id
+        Task {
+            do {
+                try await action(attachment)
+            } catch {
+                store.errorMessage = error.localizedDescription
+            }
+
+            busyID = nil
+        }
+    }
+}
+
+private struct AttachmentChip: View {
+    let attachment: EmailAttachment
+    let isBusy: Bool
+    let onPreview: () -> Void
+    let onSave: () -> Void
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.xs) {
+            Button(action: onPreview) {
+                HStack(spacing: Theme.Spacing.xs) {
+                    Image(systemName: "doc")
+                    Text(attachment.displayName)
+                        .lineLimit(1)
+                    if let size = attachment.sizeDescription {
+                        Text(size)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .help("Quick Look \(attachment.displayName)")
+
+            if isBusy {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Button(action: onSave) {
+                    Image(systemName: "arrow.down.circle")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Save to Downloads")
+            }
+        }
+        .font(.callout)
+        .padding(.horizontal, Theme.Spacing.sm)
+        .padding(.vertical, Theme.Spacing.xs)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: Theme.Radius.small))
+        .disabled(isBusy)
     }
 }
 
