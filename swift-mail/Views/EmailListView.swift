@@ -3,59 +3,114 @@ import SwiftUI
 struct EmailListView: View {
     @ObservedObject var store: MailStore
 
+    private var searchBinding: Binding<String> {
+        Binding(
+            get: { store.searchText },
+            set: { store.searchQueryChanged($0) }
+        )
+    }
+
     var body: some View {
-        Group {
-            if store.isLoadingEmails && store.emails.isEmpty {
-                ProgressView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if store.emails.isEmpty {
-                ContentUnavailableView("No Messages", systemImage: "tray")
-            } else {
-                List(selection: $store.selectedEmailID) {
-                    ForEach(store.emails) { email in
-                        EmailRow(email: email, store: store)
-                            .tag(email.id)
-                            .contextMenu {
-                                Button(email.isUnread ? "Mark as Read" : "Mark as Unread") {
-                                    Task {
-                                        await store.toggleReadState(emailID: email.id)
-                                    }
-                                }
+        content
+            .navigationTitle(store.selectedMailbox?.displayName ?? "Inbox")
+            .navigationSplitViewColumnWidth(min: Theme.Column.list.min, ideal: Theme.Column.list.ideal)
+            .searchable(text: searchBinding, prompt: "Search This Mailbox")
+            .onChange(of: store.selectedEmailID) { _, emailID in
+                guard let emailID else {
+                    return
+                }
 
-                                Button(email.isFlagged ? "Unflag" : "Flag") {
-                                    Task {
-                                        await store.toggleFlag(emailID: email.id)
-                                    }
-                                }
-
-                                Divider()
-
-                                Button("Archive") {
-                                    Task {
-                                        await store.archive(emailID: email.id)
-                                    }
-                                }
-
-                                Button("Delete", role: .destructive) {
-                                    Task {
-                                        await store.delete(emailID: email.id)
-                                    }
-                                }
-                            }
-                    }
+                Task {
+                    await store.loadEmailDetail(emailID: emailID)
                 }
             }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if store.isLoadingEmails && store.emails.isEmpty {
+            SkeletonList()
+        } else if let error = store.emailsErrorMessage, store.emails.isEmpty {
+            ContentUnavailableView {
+                Label("Couldn’t Load Messages", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(error)
+            } actions: {
+                Button("Try Again") {
+                    guard let mailboxID = store.selectedMailboxID else {
+                        return
+                    }
+
+                    Task { await store.loadEmails(mailboxID: mailboxID) }
+                }
+            }
+        } else if store.emails.isEmpty {
+            emptyState
+        } else {
+            messageList
         }
-        .navigationTitle(store.selectedMailbox?.displayName ?? "Inbox")
-        .navigationSplitViewColumnWidth(min: Theme.Column.list.min, ideal: Theme.Column.list.ideal)
-        .onChange(of: store.selectedEmailID) { _, emailID in
-            guard let emailID else {
-                return
+    }
+
+    @ViewBuilder
+    private var emptyState: some View {
+        if store.searchText.trimmingCharacters(in: .whitespaces).isEmpty {
+            ContentUnavailableView("No Messages", systemImage: "tray")
+        } else {
+            ContentUnavailableView.search(text: store.searchText)
+        }
+    }
+
+    private var messageList: some View {
+        List(selection: $store.selectedEmailID) {
+            ForEach(store.emails) { email in
+                EmailRow(email: email, store: store)
+                    .tag(email.id)
+                    .contextMenu {
+                        Button(email.isUnread ? "Mark as Read" : "Mark as Unread") {
+                            Task {
+                                await store.toggleReadState(emailID: email.id)
+                            }
+                        }
+
+                        Button(email.isFlagged ? "Unflag" : "Flag") {
+                            Task {
+                                await store.toggleFlag(emailID: email.id)
+                            }
+                        }
+
+                        Divider()
+
+                        Button("Archive") {
+                            Task {
+                                await store.archive(emailID: email.id)
+                            }
+                        }
+
+                        Button("Delete", role: .destructive) {
+                            Task {
+                                await store.delete(emailID: email.id)
+                            }
+                        }
+                    }
             }
 
-            Task {
-                await store.loadEmailDetail(emailID: emailID)
+            if store.hasMoreEmails {
+                loadMoreRow
             }
+        }
+    }
+
+    private var loadMoreRow: some View {
+        HStack {
+            Spacer()
+            ProgressView()
+                .controlSize(.small)
+            Spacer()
+        }
+        .padding(.vertical, Theme.Spacing.sm)
+        .listRowSeparator(.hidden)
+        .onAppear {
+            Task { await store.loadMoreEmails() }
         }
     }
 }
@@ -97,10 +152,19 @@ private struct EmailRow: View {
                     }
                 }
 
-                Text(email.subjectLine)
-                    .font(.callout)
-                    .fontWeight(email.isUnread ? .semibold : .regular)
-                    .lineLimit(1)
+                HStack(spacing: Theme.Spacing.xs) {
+                    Text(email.subjectLine)
+                        .font(.callout)
+                        .fontWeight(email.isUnread ? .semibold : .regular)
+                        .lineLimit(1)
+
+                    if email.hasAttachment == true {
+                        Image(systemName: "paperclip")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Has attachment")
+                    }
+                }
 
                 if let preview = email.preview, !preview.isEmpty {
                     Text(preview)
@@ -146,5 +210,29 @@ private struct EmailRow: View {
         }
         .buttonStyle(.plain)
         .font(.callout)
+    }
+}
+
+/// Placeholder rows shown while the first page of a mailbox loads, so the
+/// column has structure instead of a lone spinner.
+private struct SkeletonList: View {
+    var body: some View {
+        List {
+            ForEach(0..<8, id: \.self) { _ in
+                VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                    Text("Sender Name Placeholder")
+                        .fontWeight(.semibold)
+                    Text("A representative subject line for layout")
+                        .font(.callout)
+                    Text("Two lines of preview text that stand in for the message body while it loads over the network.")
+                        .font(.caption)
+                        .lineLimit(2)
+                }
+                .padding(.vertical, Theme.Spacing.sm - 2)
+                .redacted(reason: .placeholder)
+            }
+        }
+        .disabled(true)
+        .allowsHitTesting(false)
     }
 }

@@ -39,6 +39,13 @@ private struct MailHomeView: View {
             EmailDetailView(store: store)
         }
         .toolbar { toolbar }
+        .safeAreaInset(edge: .bottom) {
+            if let message = store.backgroundErrorMessage {
+                BackgroundErrorBanner(message: message) {
+                    store.backgroundErrorMessage = nil
+                }
+            }
+        }
         .alert("Mail Error", isPresented: Binding(
             get: { store.errorMessage != nil },
             set: { if !$0 { store.errorMessage = nil } }
@@ -190,6 +197,40 @@ private struct MailHomeView: View {
 
     private func compose(_ draft: ComposeDraft) {
         openWindow(id: ComposeWindow.id, value: draft)
+    }
+}
+
+/// A non-modal banner for auto-fetch failures — a stale-data problem the user
+/// didn't ask for shouldn't seize a modal alert the way a failed send does.
+private struct BackgroundErrorBanner: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            Image(systemName: "wifi.exclamationmark")
+                .foregroundStyle(.orange)
+
+            Text(message)
+                .font(.callout)
+                .lineLimit(2)
+
+            Spacer(minLength: Theme.Spacing.sm)
+
+            Button {
+                onDismiss()
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, Theme.Spacing.lg)
+        .padding(.vertical, Theme.Spacing.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.bar)
+        .overlay(alignment: .top) { Divider() }
+        .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 }
 

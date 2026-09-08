@@ -12,20 +12,43 @@ final class MailStore: ObservableObject {
     @Published var selectedEmail: EmailDetail?
     @Published var isLoadingMailboxes = false
     @Published var isLoadingEmails = false
+    @Published var isLoadingMoreEmails = false
     @Published var isLoadingSelectedEmail = false
     @Published var updatingReadStateEmailIDs: Set<EmailPreview.ID> = []
     @Published var updatingFlagEmailIDs: Set<EmailPreview.ID> = []
     @Published var movingEmailIDs: Set<EmailPreview.ID> = []
     @Published var identities: [MailIdentity] = []
+    /// Modal-alert error for discrete, user-initiated actions (send, flag,
+    /// archive, manual refresh). Background and column-scoped failures use the
+    /// dedicated properties below so they don't interrupt the user.
     @Published var errorMessage: String?
+    /// Inline banner for auto-fetch failures.
+    @Published var backgroundErrorMessage: String?
+    /// Inline state for the message-list column.
+    @Published var emailsErrorMessage: String?
+    /// Inline state for the reader column.
+    @Published var detailErrorMessage: String?
+    /// The live search query. Empty means the plain mailbox listing.
+    @Published var searchText = ""
+    @Published var hasMoreEmails = false
 
     private var session: JMAPSession?
     private var accountID: String?
     private var bearerToken: String?
     private var autoFetchTask: Task<Void, Never>?
+    private var searchTask: Task<Void, Never>?
     private var knownInboxEmailIDs: Set<EmailPreview.ID> = []
     private var hasLoadedInitialInboxSnapshot = false
     private let notificationService = NotificationService()
+
+    private let emailPageSize = 50
+
+    /// The query the currently displayed `emails` were fetched with, so
+    /// background refreshes and load-more stay consistent with what's on screen.
+    private var activeSearch: String? {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 
     private let accountStorageKey = "swift-mail.account"
 
@@ -133,26 +156,118 @@ final class MailStore: ObservableObject {
             return
         }
 
+        // Switching mailboxes abandons any in-progress search.
+        if mailboxID != selectedMailboxID, !searchText.isEmpty {
+            searchTask?.cancel()
+            searchText = ""
+        }
+
         selectedMailboxID = mailboxID
         isLoadingEmails = true
         selectedEmail = nil
         selectedEmailID = nil
-        errorMessage = nil
+        emailsErrorMessage = nil
+        detailErrorMessage = nil
+        hasMoreEmails = false
+
+        let search = activeSearch
 
         do {
-            let fetchedEmails = try await client.fetchEmailPreviews(session: session, accountID: accountID, mailboxID: mailboxID)
-            handleFetchedEmails(fetchedEmails, mailboxID: mailboxID)
-            emails = fetchedEmails
+            let page = try await client.fetchEmailPreviews(
+                session: session,
+                accountID: accountID,
+                mailboxID: mailboxID,
+                position: 0,
+                limit: emailPageSize,
+                searchText: search
+            )
+
+            if search == nil {
+                handleFetchedEmails(page.previews, mailboxID: mailboxID)
+            }
+
+            emails = page.previews
+            applyPageMetadata(page)
             selectedEmailID = emails.first?.id
 
             if let selectedEmailID {
                 await loadEmailDetail(emailID: selectedEmailID)
             }
         } catch {
-            errorMessage = error.localizedDescription
+            emails = []
+            emailsErrorMessage = error.localizedDescription
         }
 
         isLoadingEmails = false
+    }
+
+    /// Appends the next page of the current mailbox/search listing.
+    func loadMoreEmails() async {
+        guard hasMoreEmails,
+              !isLoadingEmails,
+              !isLoadingMoreEmails,
+              let client = makeClient(),
+              let session,
+              let accountID,
+              let mailboxID = selectedMailboxID else {
+            return
+        }
+
+        isLoadingMoreEmails = true
+        let search = activeSearch
+        let nextPosition = emails.count
+
+        do {
+            let page = try await client.fetchEmailPreviews(
+                session: session,
+                accountID: accountID,
+                mailboxID: mailboxID,
+                position: nextPosition,
+                limit: emailPageSize,
+                searchText: search
+            )
+
+            // Guard against a mailbox/search switch that landed mid-request.
+            guard selectedMailboxID == mailboxID, activeSearch == search else {
+                isLoadingMoreEmails = false
+                return
+            }
+
+            let known = Set(emails.map(\.id))
+            emails.append(contentsOf: page.previews.filter { !known.contains($0.id) })
+            applyPageMetadata(page)
+        } catch {
+            emailsErrorMessage = error.localizedDescription
+        }
+
+        isLoadingMoreEmails = false
+    }
+
+    /// Debounced entry point for the search field.
+    func searchQueryChanged(_ text: String) {
+        searchText = text
+        searchTask?.cancel()
+
+        guard let mailboxID = selectedMailboxID else {
+            return
+        }
+
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else {
+                return
+            }
+
+            await self?.loadEmails(mailboxID: mailboxID)
+        }
+    }
+
+    private func applyPageMetadata(_ page: JMAPClient.EmailPreviewPage) {
+        if let total = page.total {
+            hasMoreEmails = emails.count < total
+        } else {
+            hasMoreEmails = page.previews.count >= emailPageSize
+        }
     }
 
     func loadEmailDetail(emailID: EmailPreview.ID) async {
@@ -162,12 +277,12 @@ final class MailStore: ObservableObject {
 
         selectedEmailID = emailID
         isLoadingSelectedEmail = true
-        errorMessage = nil
+        detailErrorMessage = nil
 
         do {
             selectedEmail = try await client.fetchEmailDetail(session: session, accountID: accountID, emailID: emailID)
         } catch {
-            errorMessage = error.localizedDescription
+            detailErrorMessage = error.localizedDescription
         }
 
         isLoadingSelectedEmail = false
@@ -297,8 +412,32 @@ final class MailStore: ObservableObject {
             draftsMailboxID: draftsMailboxID
         )
 
+        await discardResumedDraft(draft, context: context)
         await refreshIfViewing(mailboxRole: "drafts")
         return emailID
+    }
+
+    /// Removes the pre-edit copy of a resumed draft. Best-effort: a failure here
+    /// must not fail the save/send that already succeeded.
+    private func discardResumedDraft(
+        _ draft: ComposeDraft,
+        context: (client: JMAPClient, session: JMAPSession, accountID: String)
+    ) async {
+        guard let sourceDraftID = draft.sourceDraftID else {
+            return
+        }
+
+        try? await context.client.destroyEmail(
+            session: context.session,
+            accountID: context.accountID,
+            emailID: sourceDraftID
+        )
+
+        if selectedEmail?.id == sourceDraftID {
+            selectedEmail = nil
+            selectedEmailID = nil
+        }
+        emails.removeAll { $0.id == sourceDraftID }
     }
 
     func send(_ draft: ComposeDraft) async throws {
@@ -317,6 +456,8 @@ final class MailStore: ObservableObject {
             draftsMailboxID: draftsMailboxID,
             sentMailboxID: mailbox(role: "sent")?.id
         )
+
+        await discardResumedDraft(draft, context: context)
 
         if let originalEmailID = draft.originalEmailID, selectedEmail?.id == originalEmailID {
             await loadEmailDetail(emailID: originalEmailID)
@@ -353,14 +494,6 @@ final class MailStore: ObservableObject {
         }
 
         await loadEmails(mailboxID: mailboxID)
-    }
-
-    func startAutoFetch() {
-        guard let session else {
-            return
-        }
-
-        startAutoFetchIfNeeded(session: session)
     }
 
     func stopAutoFetch() {
@@ -438,20 +571,59 @@ final class MailStore: ObservableObject {
             let mailboxes = try await client.fetchMailboxes(session: session, accountID: accountID)
             self.mailboxes = mailboxes
 
-            guard let inboxID = mailboxes.first(where: { $0.role == "inbox" })?.id else {
-                return
+            let inboxID = mailboxes.first(where: { $0.role == "inbox" })?.id
+
+            // Keep the Inbox snapshot current for new-message notifications even
+            // when the user is looking at another mailbox. When the Inbox *is*
+            // the visible list, fetch as far as the user has scrolled so a
+            // background refresh doesn't truncate loaded pages.
+            if let inboxID {
+                let inboxLimit = selectedMailboxID == inboxID ? max(emailPageSize, emails.count) : emailPageSize
+                let inboxPage = try await client.fetchEmailPreviews(
+                    session: session,
+                    accountID: accountID,
+                    mailboxID: inboxID,
+                    limit: inboxLimit
+                )
+                handleFetchedEmails(inboxPage.previews, mailboxID: inboxID)
+
+                if selectedMailboxID == inboxID, activeSearch == nil {
+                    applyRefreshedList(inboxPage)
+                }
             }
 
-            let inboxEmails = try await client.fetchEmailPreviews(session: session, accountID: accountID, mailboxID: inboxID)
-            handleFetchedEmails(inboxEmails, mailboxID: inboxID)
+            // A non-Inbox selection would otherwise go stale until a manual
+            // refresh — fetch the range the user currently has scrolled to.
+            if let selectedMailboxID, selectedMailboxID != inboxID, activeSearch == nil {
+                let page = try await client.fetchEmailPreviews(
+                    session: session,
+                    accountID: accountID,
+                    mailboxID: selectedMailboxID,
+                    limit: max(emailPageSize, emails.count)
+                )
 
-            if selectedMailboxID == inboxID {
-                let selectedEmailID = self.selectedEmailID
-                emails = inboxEmails
-                self.selectedEmailID = selectedEmailID ?? inboxEmails.first?.id
+                guard self.selectedMailboxID == selectedMailboxID, activeSearch == nil else {
+                    return
+                }
+
+                applyRefreshedList(page)
             }
         } catch {
-            errorMessage = error.localizedDescription
+            backgroundErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Replaces the visible list from a background refresh without disturbing the
+    /// user's current selection or scroll depth.
+    private func applyRefreshedList(_ page: JMAPClient.EmailPreviewPage) {
+        let previousSelection = selectedEmailID
+        emails = page.previews
+        applyPageMetadata(page)
+
+        if let previousSelection, page.previews.contains(where: { $0.id == previousSelection }) {
+            selectedEmailID = previousSelection
+        } else {
+            selectedEmailID = page.previews.first?.id
         }
     }
 
@@ -558,6 +730,7 @@ final class MailStore: ObservableObject {
                 id: mailbox.id,
                 name: mailbox.name,
                 role: mailbox.role,
+                parentId: mailbox.parentId,
                 sortOrder: mailbox.sortOrder,
                 totalEmails: mailbox.totalEmails,
                 unreadEmails: adjustedUnread

@@ -17,6 +17,10 @@ struct HTMLMessageView: NSViewRepresentable {
 
     let html: String
     var chrome: Chrome = .transparent
+    /// When true, the page is loaded with a content rule list that blocks every
+    /// remote resource (images, stylesheets, fonts, media), so merely opening a
+    /// message never phones home to the sender.
+    var blocksRemoteContent = false
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
@@ -34,13 +38,37 @@ struct HTMLMessageView: NSViewRepresentable {
     func updateNSView(_ webView: WKWebView, context: Context) {
         applyChrome(to: webView)
 
-        guard context.coordinator.loadedHTML != html || context.coordinator.loadedChrome != chrome else {
+        let needsReload = context.coordinator.loadedHTML != html
+            || context.coordinator.loadedChrome != chrome
+            || context.coordinator.loadedBlocksRemoteContent != blocksRemoteContent
+
+        guard needsReload else {
             return
         }
 
         context.coordinator.loadedHTML = html
         context.coordinator.loadedChrome = chrome
-        webView.loadHTMLString(html.readerStyled(transparent: chrome == .transparent), baseURL: nil)
+        context.coordinator.loadedBlocksRemoteContent = blocksRemoteContent
+
+        let styledHTML = html.readerStyled(transparent: chrome == .transparent)
+        let shouldBlock = blocksRemoteContent
+
+        Task { @MainActor in
+            let controller = webView.configuration.userContentController
+            controller.removeAllContentRuleLists()
+
+            if shouldBlock, let ruleList = await RemoteContentBlocker.ruleList() {
+                controller.add(ruleList)
+            }
+
+            // A late-arriving update may already have superseded this load.
+            guard context.coordinator.loadedHTML == html,
+                  context.coordinator.loadedBlocksRemoteContent == shouldBlock else {
+                return
+            }
+
+            webView.loadHTMLString(styledHTML, baseURL: nil)
+        }
     }
 
     /// `underPageBackgroundColor` (macOS 13+) is the supported way to make a
@@ -59,6 +87,7 @@ struct HTMLMessageView: NSViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate {
         var loadedHTML: String?
         var loadedChrome: Chrome?
+        var loadedBlocksRemoteContent: Bool?
 
         func webView(
             _ webView: WKWebView,
@@ -75,6 +104,39 @@ struct HTMLMessageView: NSViewRepresentable {
 
             decisionHandler(.allow)
         }
+    }
+}
+
+/// Compiles — once per launch — a `WKContentRuleList` that blocks remote
+/// resource loads from message HTML. Reused across every reader web view.
+enum RemoteContentBlocker {
+    private static let identifier = "swift-mail.block-remote-content"
+
+    private static let encodedRuleList = """
+    [
+      {
+        "trigger": {
+          "url-filter": "^https?://",
+          "resource-type": ["image", "style-sheet", "font", "media", "raw", "svg-document", "fetch", "websocket", "other", "ping"]
+        },
+        "action": { "type": "block" }
+      }
+    ]
+    """
+
+    private static let compiled = Task<WKContentRuleList?, Never> {
+        guard let store = WKContentRuleListStore.default() else {
+            return nil
+        }
+
+        return try? await store.compileContentRuleList(
+            forIdentifier: identifier,
+            encodedContentRuleList: encodedRuleList
+        )
+    }
+
+    static func ruleList() async -> WKContentRuleList? {
+        await compiled.value
     }
 }
 

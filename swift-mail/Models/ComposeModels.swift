@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// A sending identity, as returned by `Identity/get` (RFC 8621 §6).
@@ -30,11 +31,13 @@ nonisolated enum ComposeMode: String, Codable, Hashable {
     case reply
     case replyAll
     case forward
+    /// Resuming a message already saved in the Drafts mailbox.
+    case editDraft
 
     /// The keyword set on the message this draft responds to, once it is sent.
     var originalKeyword: String? {
         switch self {
-        case .new: return nil
+        case .new, .editDraft: return nil
         case .reply, .replyAll: return "$answered"
         case .forward: return "$forwarded"
         }
@@ -62,6 +65,10 @@ nonisolated struct ComposeDraft: Identifiable, Hashable, Codable {
     var references: [String] = []
     /// The message this draft answers, so it can be flagged once the draft sends.
     var originalEmailID: String?
+    /// When resuming a saved draft, the Drafts-mailbox email this window came
+    /// from — destroyed once the resumed draft is re-saved or sent so its stale
+    /// earlier version doesn't linger.
+    var sourceDraftID: String?
     /// Persisted so a reopened window keeps the fields the user revealed.
     var showsCarbonCopy = false
 
@@ -87,6 +94,38 @@ nonisolated extension ComposeDraft {
             bcc: identity?.bcc ?? [],
             markdown: signatureBlock(for: identity)
         )
+    }
+
+    /// Resumes a message from the Drafts mailbox. The window id is derived from
+    /// the source email so re-selecting the same draft focuses the open window
+    /// instead of spawning a second one.
+    static func editDraft(from email: EmailDetail, identity: MailIdentity?) -> ComposeDraft {
+        let carbonCopy = email.cc ?? []
+        let blindCarbonCopy = email.bcc ?? []
+
+        var draft = ComposeDraft(
+            id: deterministicID(for: "draft:\(email.id)"),
+            mode: .editDraft,
+            identityID: identity?.id,
+            to: email.to ?? [],
+            cc: carbonCopy,
+            bcc: blindCarbonCopy,
+            subject: email.subject ?? "",
+            markdown: email.readableBody,
+            inReplyTo: email.inReplyTo ?? [],
+            references: email.references ?? [],
+            showsCarbonCopy: !carbonCopy.isEmpty || !blindCarbonCopy.isEmpty
+        )
+
+        draft.sourceDraftID = email.id
+        return draft
+    }
+
+    /// A stable UUID for a given seed string, so a window value stays equal
+    /// across reopens and SwiftUI reuses the existing window.
+    private static func deterministicID(for seed: String) -> UUID {
+        let digest = Insecure.MD5.hash(data: Data(seed.utf8))
+        return NSUUID(uuidBytes: Array(digest)) as UUID
     }
 
     static func reply(to email: EmailDetail, identity: MailIdentity?, replyAll: Bool) -> ComposeDraft {

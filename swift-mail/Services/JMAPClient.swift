@@ -34,7 +34,7 @@ final class JMAPClient {
                     "Mailbox/get",
                     [
                         "accountId": accountID,
-                        "properties": ["id", "name", "role", "sortOrder", "totalEmails", "unreadEmails"]
+                        "properties": ["id", "name", "role", "parentId", "sortOrder", "totalEmails", "unreadEmails"]
                     ],
                     "mailboxes"
                 ]
@@ -57,7 +57,25 @@ final class JMAPClient {
         }
     }
 
-    func fetchEmailPreviews(session: JMAPSession, accountID: String, mailboxID: String) async throws -> [EmailPreview] {
+    /// One page of a mailbox's message list.
+    ///
+    /// `Email/get` does not promise to return records in the order they were
+    /// asked for, so the previews are re-sorted here to match the `Email/query`
+    /// order — which matters once pages are stitched together on scroll.
+    struct EmailPreviewPage {
+        let previews: [EmailPreview]
+        let position: Int
+        let total: Int?
+    }
+
+    func fetchEmailPreviews(
+        session: JMAPSession,
+        accountID: String,
+        mailboxID: String,
+        position: Int = 0,
+        limit: Int = 50,
+        searchText: String? = nil
+    ) async throws -> EmailPreviewPage {
         let properties = [
             "id",
             "mailboxIds",
@@ -66,8 +84,14 @@ final class JMAPClient {
             "subject",
             "receivedAt",
             "preview",
-            "keywords"
+            "keywords",
+            "hasAttachment"
         ]
+
+        var filter: [String: Any] = ["inMailbox": mailboxID]
+        if let searchText = searchText?.trimmingCharacters(in: .whitespacesAndNewlines), !searchText.isEmpty {
+            filter["text"] = searchText
+        }
 
         let response = try await call(
             apiURL: session.apiURL,
@@ -76,9 +100,11 @@ final class JMAPClient {
                     "Email/query",
                     [
                         "accountId": accountID,
-                        "filter": ["inMailbox": mailboxID],
+                        "filter": filter,
                         "sort": [["property": "receivedAt", "isAscending": false]],
-                        "limit": 50
+                        "position": position,
+                        "limit": limit,
+                        "calculateTotal": true
                     ],
                     "query"
                 ],
@@ -98,9 +124,23 @@ final class JMAPClient {
             ]
         )
 
+        let queryPayload = try response.payload(named: "Email/query", clientID: "query")
+        let orderedIDs = (queryPayload["ids"] as? [String]) ?? []
+        let queryPosition = queryPayload["position"] as? Int ?? position
+        let total = queryPayload["total"] as? Int
+
         let payload = try response.payload(named: "Email/get", clientID: "emails")
         let listData = try JSONSerialization.data(withJSONObject: payload["list"] ?? [])
-        return try decoder.decode([EmailPreview].self, from: listData)
+        let previews = try decoder.decode([EmailPreview].self, from: listData)
+
+        let byID = Dictionary(previews.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let ordered = orderedIDs.compactMap { byID[$0] }
+
+        return EmailPreviewPage(
+            previews: ordered.isEmpty ? previews : ordered,
+            position: queryPosition,
+            total: total
+        )
     }
 
     func fetchEmailDetail(session: JMAPSession, accountID: String, emailID: String) async throws -> EmailDetail {
@@ -129,7 +169,8 @@ final class JMAPClient {
                             "keywords",
                             "textBody",
                             "htmlBody",
-                            "bodyValues"
+                            "bodyValues",
+                            "attachments"
                         ],
                         "fetchTextBodyValues": true,
                         "fetchHTMLBodyValues": true,
@@ -274,6 +315,28 @@ final class JMAPClient {
         }
 
         return emailID
+    }
+
+    /// Permanently removes a draft the user resumed editing, so a resumed draft
+    /// that is re-saved or sent doesn't leave its earlier version behind in the
+    /// Drafts mailbox. A no-op `notDestroyed` entry is tolerated — the draft may
+    /// already be gone.
+    func destroyEmail(session: JMAPSession, accountID: String, emailID: String) async throws {
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "Email/set",
+                    [
+                        "accountId": accountID,
+                        "destroy": [emailID]
+                    ],
+                    "destroyEmail"
+                ]
+            ]
+        )
+
+        _ = try response.payload(named: "Email/set", clientID: "destroyEmail")
     }
 
     /// Creates the message and hands it to the submission queue in one request.

@@ -80,6 +80,7 @@ nonisolated struct Mailbox: Identifiable, Hashable, Decodable {
     let id: String
     let name: String
     let role: String?
+    let parentId: String?
     let sortOrder: Int?
     let totalEmails: Int?
     let unreadEmails: Int?
@@ -120,6 +121,7 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
     let receivedAt: Date?
     let preview: String?
     let keywords: [String: Bool]?
+    let hasAttachment: Bool?
 
     var senderLine: String {
         from?.first?.name?.nilIfEmpty ?? from?.first?.email ?? "Unknown Sender"
@@ -161,7 +163,8 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
             subject: subject,
             receivedAt: receivedAt,
             preview: preview,
-            keywords: keywords
+            keywords: keywords,
+            hasAttachment: hasAttachment
         )
     }
 }
@@ -170,6 +173,44 @@ nonisolated struct EmailBodyPart: Hashable, Decodable {
     let partId: String?
     let type: String?
     let name: String?
+}
+
+/// A file attached to a message, as returned in `Email.attachments` (RFC 8621 §4.1.4).
+nonisolated struct EmailAttachment: Hashable, Decodable, Identifiable {
+    let blobId: String?
+    let type: String?
+    let name: String?
+    let size: Int?
+    let disposition: String?
+    let cid: String?
+
+    var id: String { blobId ?? "\(name ?? "attachment")-\(size ?? 0)" }
+
+    /// Inline images referenced from the body by `cid:` are part of the message,
+    /// not attachments the reader should list separately. A part explicitly
+    /// marked `attachment` is always listed even when it carries a `cid`.
+    var isInline: Bool {
+        switch disposition?.lowercased() {
+        case "inline":
+            return true
+        case "attachment":
+            return false
+        default:
+            return cid != nil
+        }
+    }
+
+    var displayName: String {
+        name?.nilIfEmpty ?? "Attachment"
+    }
+
+    var sizeDescription: String? {
+        guard let size, size > 0 else {
+            return nil
+        }
+
+        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+    }
 }
 
 nonisolated struct EmailDetail: Identifiable, Hashable, Decodable {
@@ -190,6 +231,13 @@ nonisolated struct EmailDetail: Identifiable, Hashable, Decodable {
     let textBody: [EmailBodyPart]?
     let htmlBody: [EmailBodyPart]?
     let bodyValues: [String: EmailBodyValue]?
+    let attachments: [EmailAttachment]?
+
+    /// Attachments worth listing in the reader — inline images referenced by the
+    /// HTML body are excluded.
+    var listedAttachments: [EmailAttachment] {
+        (attachments ?? []).filter { !$0.isInline }
+    }
 
     var subjectLine: String {
         subject?.nilIfEmpty ?? "No Subject"
@@ -221,6 +269,19 @@ nonisolated struct EmailDetail: Identifiable, Hashable, Decodable {
         }
 
         return preview ?? ""
+    }
+
+    /// Whether the HTML body pulls in resources over the network. Used to decide
+    /// whether to offer a "Load Images" affordance before rendering.
+    var htmlBodyLoadsRemoteContent: Bool {
+        guard let html = firstBodyValue(from: htmlBody) else {
+            return false
+        }
+
+        return html.range(
+            of: "(src|background|srcset)\\s*=\\s*[\"']?\\s*https?://|url\\(\\s*[\"']?https?://",
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
     }
 
     var htmlDocument: String {
@@ -287,7 +348,8 @@ nonisolated struct EmailDetail: Identifiable, Hashable, Decodable {
             keywords: keywords,
             textBody: textBody,
             htmlBody: htmlBody,
-            bodyValues: bodyValues
+            bodyValues: bodyValues,
+            attachments: attachments
         )
     }
 
