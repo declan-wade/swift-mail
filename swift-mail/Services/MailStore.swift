@@ -154,8 +154,33 @@ final class MailStore: ObservableObject {
         session?.capabilityURNs.sorted() ?? []
     }
 
+    /// Capabilities this account may actually use, which is where a server can
+    /// put a feature it doesn't advertise server-wide.
+    var accountCapabilities: [String] {
+        session?.accountCapabilityURNs(accountID: accountID).sorted() ?? []
+    }
+
+    /// Server limits worth showing, as label/value pairs.
+    var serverLimits: [(label: String, value: String)] {
+        guard let limits = session?.coreLimits else {
+            return []
+        }
+
+        func bytes(_ value: Int?) -> String? {
+            value.map { Int64($0).formatted(.byteCount(style: .file)) }
+        }
+
+        return [
+            ("Objects per set", limits.maxObjectsInSet?.formatted()),
+            ("Objects per get", limits.maxObjectsInGet?.formatted()),
+            ("Calls per request", limits.maxCallsInRequest?.formatted()),
+            ("Max request size", bytes(limits.maxSizeRequest)),
+            ("Max upload size", bytes(limits.maxSizeUpload))
+        ].compactMap { label, value in value.map { (label, $0) } }
+    }
+
     var supportsSnooze: Bool {
-        session?.supports(JMAPCapability.snoozeURN) ?? false
+        session?.supports(JMAPCapability.snoozeURN, accountID: accountID) ?? false
     }
 
     var hasConfiguredAccount: Bool {
@@ -526,10 +551,20 @@ final class MailStore: ObservableObject {
     /// ponytail: fixed cap; make it a prompt ("sweep the first 5,000?") if
     /// anyone actually hits it.
     private static let sweepLimit = 5_000
-    /// Well under any server's `maxObjectsInSet`, which this client doesn't
-    /// read. ponytail: raise it by decoding the core capability if sweeps of
-    /// tens of thousands ever feel slow.
-    private static let sweepBatchSize = 100
+    /// Ids per `Email/query` page while gathering the match set.
+    private static let sweepPageSize = 250
+    /// Fallback when the server doesn't advertise a limit. RFC 8620 2 suggests
+    /// a minimum of 500 for `maxObjectsInSet`, so this is deliberately timid.
+    private static let fallbackSetBatchSize = 100
+    /// Upper bound regardless of what the server allows, so one `Email/set`
+    /// stays a sane request rather than a single enormous one.
+    private static let maxSetBatchSize = 500
+
+    /// How many updates to put in one `Email/set`, from the server's own
+    /// `maxObjectsInSet` rather than a guess.
+    private var sweepBatchSize: Int {
+        min(session?.coreLimits?.maxObjectsInSet ?? Self.fallbackSetBatchSize, Self.maxSetBatchSize)
+    }
 
     /// The filter a sweep would run, or nil if the query is empty. An empty
     /// query must never mean "everything in this folder".
@@ -593,7 +628,7 @@ final class MailStore: ObservableObject {
                 accountID: accountID,
                 searchFilter: filter,
                 position: position,
-                limit: Self.sweepBatchSize
+                limit: Self.sweepPageSize
             )
 
             // Mail arriving mid-page shifts every later position down, which
@@ -602,15 +637,16 @@ final class MailStore: ObservableObject {
             position += page.ids.count
             ids += page.ids.filter { seen.insert($0).inserted }
 
-            if page.ids.count < Self.sweepBatchSize {
+            if page.ids.count < Self.sweepPageSize {
                 break
             }
         }
 
         var moved = 0
+        let batchSize = sweepBatchSize
 
-        for start in stride(from: 0, to: ids.count, by: Self.sweepBatchSize) {
-            let batch = Array(ids[start..<min(start + Self.sweepBatchSize, ids.count)])
+        for start in stride(from: 0, to: ids.count, by: batchSize) {
+            let batch = Array(ids[start..<min(start + batchSize, ids.count)])
             let refused = try await client.moveEmails(
                 session: session,
                 accountID: accountID,

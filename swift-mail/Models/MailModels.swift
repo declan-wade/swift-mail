@@ -15,6 +15,10 @@ nonisolated struct JMAPSession: Decodable {
     let primaryAccounts: [String: String]
     /// Optional so a server that omits it still logs in; RFC 8620 2 requires it.
     let capabilities: [String: JMAPCapabilityProperties]?
+    /// Per-account capabilities. RFC 8620 1.6.2 makes this the authoritative
+    /// answer to "can I call these methods on this account" — the server-wide
+    /// list only says what the server implements at all.
+    let accounts: [String: JMAPAccount]?
 
     /// Expands `downloadUrl` for one blob. Every value is percent-encoded, so
     /// an attachment named `../../etc` can only ever be one path segment.
@@ -48,8 +52,23 @@ nonisolated struct JMAPSession: Decodable {
         Set((capabilities ?? [:]).keys)
     }
 
-    func supports(_ capability: String) -> Bool {
-        capabilityURNs.contains(capability)
+    /// Capabilities this account is permitted to use.
+    func accountCapabilityURNs(accountID: String?) -> Set<String> {
+        guard let accountID, let account = accounts?[accountID] else {
+            return []
+        }
+
+        return Set((account.accountCapabilities ?? [:]).keys)
+    }
+
+    func supports(_ capability: String, accountID: String? = nil) -> Bool {
+        capabilityURNs.contains(capability) || accountCapabilityURNs(accountID: accountID).contains(capability)
+    }
+
+    /// The limits from `urn:ietf:params:jmap:core`, which say how much this
+    /// server will accept in one request.
+    var coreLimits: JMAPCapabilityProperties? {
+        capabilities?["urn:ietf:params:jmap:core"]
     }
 
     var mailAccountID: String? {
@@ -122,14 +141,54 @@ nonisolated struct JMAPSession: Decodable {
         case downloadURLTemplate = "downloadUrl"
         case primaryAccounts
         case capabilities
+        case accounts
     }
 }
 
-/// A capability's settings object, which this client doesn't inspect. Decoding
-/// ignores the value entirely so an unfamiliar shape can never fail the session
+nonisolated struct JMAPAccount: Decodable {
+    let name: String?
+    let isPersonal: Bool?
+    let isReadOnly: Bool?
+    let accountCapabilities: [String: JMAPCapabilityProperties]?
+}
+
+/// A capability's settings object. Every field is optional and decoded
+/// defensively: the shape is defined per capability, so most of these are nil
+/// for most capabilities, and an unfamiliar value must never fail the session
 /// decode and lock the user out of an otherwise working account.
+///
+/// The limits are `urn:ietf:params:jmap:core`'s (RFC 8620 2).
 nonisolated struct JMAPCapabilityProperties: Decodable {
-    init(from decoder: Decoder) {}
+    let maxSizeUpload: Int?
+    let maxSizeRequest: Int?
+    let maxCallsInRequest: Int?
+    let maxObjectsInGet: Int?
+    let maxObjectsInSet: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case maxSizeUpload, maxSizeRequest, maxCallsInRequest, maxObjectsInGet, maxObjectsInSet
+    }
+
+    init(from decoder: Decoder) {
+        // Not `throws`: a capability whose value isn't an object at all, or
+        // whose fields are typed differently, leaves these nil rather than
+        // failing the whole session.
+        let container = try? decoder.container(keyedBy: CodingKeys.self)
+
+        func limit(_ key: CodingKeys) -> Int? {
+            guard let container else {
+                return nil
+            }
+
+            return (try? container.decodeIfPresent(Int.self, forKey: key)) ?? nil
+        }
+
+        maxSizeUpload = limit(.maxSizeUpload)
+        maxSizeRequest = limit(.maxSizeRequest)
+        maxCallsInRequest = limit(.maxCallsInRequest)
+        maxObjectsInGet = limit(.maxObjectsInGet)
+        maxObjectsInSet = limit(.maxObjectsInSet)
+    }
 }
 
 private extension CharacterSet {

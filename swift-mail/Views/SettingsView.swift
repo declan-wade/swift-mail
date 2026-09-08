@@ -135,35 +135,60 @@ private struct NotificationSettings: View {
 
 // MARK: - Advanced
 
-/// Read-only diagnostics about the connected server.
+/// Read-only diagnostics about the connected server: what it implements, what
+/// this account may actually use, and the limits it will accept.
 private struct AdvancedSettings: View {
     @ObservedObject var store: MailStore
 
     var body: some View {
         Form {
             Section {
-                if store.serverCapabilities.isEmpty {
-                    Text("Connect an account to see what the server supports.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(store.serverCapabilities, id: \.self) { capability in
-                        Text(capability)
-                            .font(.callout.monospaced())
-                            .textSelection(.enabled)
-                    }
-                }
+                urns(store.serverCapabilities, empty: "Connect an account to see what the server supports.")
             } header: {
                 Text("Server Capabilities")
             } footer: {
-                Text(store.serverCapabilities.isEmpty
-                     ? "The JMAP extensions the server advertises."
-                     : "Snooze (\(JMAPCapability.snoozeURN)) is \(store.supportsSnooze ? "advertised" : "not advertised") by this server.")
+                Text("The JMAP extensions this server implements.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section {
+                urns(store.accountCapabilities, empty: "None advertised for this account.")
+            } header: {
+                Text("Account Capabilities")
+            } footer: {
+                Text("What this account may actually use. A server can implement a feature without granting it here — this is the list that decides whether a method call will work.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if !store.serverLimits.isEmpty {
+                Section("Limits") {
+                    ForEach(store.serverLimits, id: \.label) { limit in
+                        LabeledContent(limit.label, value: limit.value)
+                    }
+                }
+            }
+
+            Section("Features") {
+                LabeledContent("Snooze", value: store.supportsSnooze ? "Available" : "Not available")
+            }
         }
-        // Sized to the capability list this server actually returns, with room
-        // for a couple more; a longer list scrolls rather than stretching.
-        .settingsPane(height: 240)
+        // Diagnostics run long; the tail scrolls rather than making the
+        // window taller than the other panes by half again.
+        .settingsPane(height: 520)
+    }
+
+    @ViewBuilder
+    private func urns(_ list: [String], empty: String) -> some View {
+        if list.isEmpty {
+            Text(empty).foregroundStyle(.secondary)
+        } else {
+            ForEach(list, id: \.self) { urn in
+                Text(urn)
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+            }
+        }
     }
 }
