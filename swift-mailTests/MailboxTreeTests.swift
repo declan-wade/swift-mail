@@ -6,6 +6,16 @@ struct MailboxTreeTests {
         Mailbox(id: id, name: id, role: role, parentId: parent, sortOrder: nil, totalEmails: nil, unreadEmails: nil)
     }
 
+    @Test("System mailboxes are recognised by role or name, user folders are not")
+    func systemClassification() {
+        #expect(mailbox("Inbox", role: "inbox").iconName == "tray")
+        #expect(mailbox("Snoozed").iconName == "moon.zzz")
+        #expect(mailbox("Memos").iconName == "note.text")
+        #expect(mailbox("Scheduled").iconName == "calendar.badge.clock")
+        #expect(mailbox("AliExpress").isSystem == false)
+        #expect(mailbox("AliExpress").iconName == "folder")
+    }
+
     @Test("Top-level mailboxes become roots and keep their input order")
     func flatListStaysFlat() {
         let nodes = MailboxNode.tree(from: [mailbox("A"), mailbox("B"), mailbox("C")])

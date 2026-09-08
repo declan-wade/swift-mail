@@ -5,13 +5,14 @@ struct MailboxSidebarView: View {
 
     var body: some View {
         List(selection: $store.selectedMailboxID) {
+            let roots = MailboxNode.tree(from: store.mailboxes)
+
             Section(store.account?.displayName ?? "Mail") {
-                ForEach(MailboxNode.tree(from: store.mailboxes)) { node in
-                    OutlineGroup(node, children: \.children) { item in
-                        MailboxRow(mailbox: item.mailbox)
-                            .tag(item.mailbox.id)
-                    }
-                }
+                rows(for: roots.filter(\.mailbox.isSystem))
+            }
+
+            Section("Folders") {
+                rows(for: roots.filter { !$0.mailbox.isSystem })
             }
         }
         .navigationSplitViewColumnWidth(min: Theme.Column.sidebar.min, ideal: Theme.Column.sidebar.ideal)
@@ -22,6 +23,16 @@ struct MailboxSidebarView: View {
 
             Task {
                 await store.loadEmails(mailboxID: mailboxID)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func rows(for nodes: [MailboxNode]) -> some View {
+        ForEach(nodes) { node in
+            OutlineGroup(node, children: \.children) { item in
+                MailboxRow(mailbox: item.mailbox)
+                    .tag(item.mailbox.id)
             }
         }
     }
@@ -77,26 +88,7 @@ private struct MailboxRow: View {
                 }
             }
         } icon: {
-            Image(systemName: iconName)
-        }
-    }
-
-    private var iconName: String {
-        switch mailbox.role {
-        case "inbox":
-            return "tray"
-        case "sent":
-            return "paperplane"
-        case "drafts":
-            return "doc"
-        case "trash":
-            return "trash"
-        case "archive":
-            return "archivebox"
-        case "junk":
-            return "exclamationmark.octagon"
-        default:
-            return "folder"
+            Image(systemName: mailbox.iconName)
         }
     }
 }

@@ -92,6 +92,35 @@ nonisolated struct Mailbox: Identifiable, Hashable, Decodable {
 
         return name
     }
+
+    /// Mailboxes the server manages itself, which the sidebar groups above the
+    /// user's own folders.
+    var isSystem: Bool { icon != nil }
+
+    var iconName: String { icon ?? "folder" }
+
+    /// Matched on role first, then on name: JMAP has no role for Fastmail's
+    /// Snoozed, Scheduled or Memos mailboxes.
+    /// ponytail: name matching also claims a user folder called e.g. "Notes";
+    /// switch to a server-provided role if one ever appears.
+    private var icon: String? {
+        Self.systemIcons[role ?? ""] ?? Self.systemIcons[name.lowercased()]
+    }
+
+    private static let systemIcons: [String: String] = [
+        "inbox": "tray",
+        "snoozed": "moon.zzz",
+        "archive": "archivebox",
+        "memos": "note.text",
+        "notes": "note.text",
+        "drafts": "doc",
+        "scheduled": "calendar.badge.clock",
+        "sent": "paperplane",
+        "junk": "exclamationmark.octagon",
+        "spam": "exclamationmark.octagon",
+        "trash": "trash",
+        "templates": "doc.on.doc"
+    ]
 }
 
 nonisolated struct EmailAddress: Hashable, Codable {
