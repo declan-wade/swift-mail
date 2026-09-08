@@ -103,6 +103,21 @@ final class MarkdownTextView: NSTextView {
             wrapSelection(with: "~~")
         case ("k", false):
             insertLink()
+        case ("1", false):
+            toggleBlockPrefix(.heading(level: 1))
+        case ("2", false):
+            toggleBlockPrefix(.heading(level: 2))
+        case ("3", false):
+            toggleBlockPrefix(.heading(level: 3))
+        // Letters rather than ⇧⌘7/⇧⌘9: `charactersIgnoringModifiers` keeps
+        // shift applied, so a shifted digit arrives as "&" or "(" and the
+        // mapping would break on any non-US keyboard layout.
+        case ("l", true):
+            toggleBlockPrefix(.bullet)
+        case ("o", true):
+            toggleBlockPrefix(.numbered)
+        case ("'", false):
+            toggleBlockPrefix(.quote)
         default:
             return super.performKeyEquivalent(with: event)
         }
@@ -187,6 +202,43 @@ final class MarkdownTextView: NSTextView {
         replaceCharacters(in: range, with: wrapped, selecting: selection)
     }
 
+    /// Applies a block prefix to every line the selection touches. Multi-line
+    /// numbered lists are numbered as they're applied.
+    private func toggleBlockPrefix(_ kind: MarkdownBlockPrefix.Kind) {
+        let text = string as NSString
+        let selection = selectedRange()
+        let lineRange = text.lineRange(for: selection)
+        let block = text.substring(with: lineRange)
+
+        // The trailing newline stays out of the transform, or the last line
+        // would be treated as an extra empty one and gain a prefix of its own.
+        let endsWithNewline = block.hasSuffix("\n")
+        let body = endsWithNewline ? String(block.dropLast()) : block
+
+        let transformed = body
+            .components(separatedBy: "\n")
+            .enumerated()
+            .map { MarkdownBlockPrefix.toggling(kind, in: $1, ordinal: $0 + 1) }
+            .joined(separator: "\n")
+            + (endsWithNewline ? "\n" : "")
+
+        let newLength = (transformed as NSString).length
+        let newlineLength = endsWithNewline ? 1 : 0
+
+        let newSelection: NSRange
+        if selection.length == 0 {
+            // Hold the caret the same distance from the end of its line, so the
+            // prefix appears without the cursor jumping away from the text.
+            let fromLineEnd = NSMaxRange(lineRange) - newlineLength - selection.location
+            let location = lineRange.location + newLength - newlineLength - fromLineEnd
+            newSelection = NSRange(location: max(location, lineRange.location), length: 0)
+        } else {
+            newSelection = NSRange(location: lineRange.location, length: newLength - newlineLength)
+        }
+
+        replaceCharacters(in: lineRange, with: transformed, selecting: newSelection)
+    }
+
     private func insertLink() {
         let range = selectedRange()
         let selected = (string as NSString).substring(with: range)
@@ -212,6 +264,75 @@ final class MarkdownTextView: NSTextView {
         textStorage?.replaceCharacters(in: range, with: replacement)
         didChangeText()
         setSelectedRange(selection)
+    }
+}
+
+/// The block-level prefix on a line — heading hashes, a list marker, or a
+/// blockquote arrow — and the rules for swapping one for another.
+///
+/// Distinct from `MarkdownLinePrefix` below, which answers a different
+/// question: what to repeat on the *next* line when Return is pressed.
+nonisolated enum MarkdownBlockPrefix {
+    enum Kind: Equatable {
+        case heading(level: Int)
+        case bullet
+        case numbered
+        case quote
+
+        /// `ordinal` only affects numbered lists, so a multi-line selection
+        /// comes out 1., 2., 3. rather than three 1.s.
+        func marker(ordinal: Int = 1) -> String {
+            switch self {
+            case .heading(let level): String(repeating: "#", count: level) + " "
+            case .bullet: "- "
+            case .numbered: "\(ordinal). "
+            case .quote: "> "
+            }
+        }
+    }
+
+    /// Applies `kind` to `line`, replacing whatever block prefix is already
+    /// there — so a subtitle becomes a title rather than `# ## text` — or
+    /// removing it when the line already carries that same kind.
+    static func toggling(_ kind: Kind, in line: String, ordinal: Int = 1) -> String {
+        let indentCount = line.prefix { $0 == " " || $0 == "\t" }.count
+        let indent = String(line.prefix(indentCount))
+        let rest = String(line.dropFirst(indentCount))
+
+        guard let existing = parse(rest) else {
+            return indent + kind.marker(ordinal: ordinal) + rest
+        }
+
+        return existing.kind == kind
+            ? indent + existing.body
+            : indent + kind.marker(ordinal: ordinal) + existing.body
+    }
+
+    /// The prefix already on `rest`, if any. Compared by kind, not by exact
+    /// text, so `*` and `-` are both bullets and `3.` is still a numbered item.
+    static func parse(_ rest: String) -> (kind: Kind, body: String)? {
+        let hashes = rest.prefix { $0 == "#" }
+        if (1...6).contains(hashes.count), rest.dropFirst(hashes.count).first == " " {
+            return (.heading(level: hashes.count), String(rest.dropFirst(hashes.count + 1)))
+        }
+
+        if let marker = rest.first, marker == "-" || marker == "*" || marker == "+",
+           rest.dropFirst().first == " " {
+            return (.bullet, String(rest.dropFirst(2)))
+        }
+
+        let digits = rest.prefix(while: \.isNumber)
+        if !digits.isEmpty,
+           let delimiter = rest.dropFirst(digits.count).first, delimiter == "." || delimiter == ")",
+           rest.dropFirst(digits.count + 1).first == " " {
+            return (.numbered, String(rest.dropFirst(digits.count + 2)))
+        }
+
+        if rest.hasPrefix("> ") {
+            return (.quote, String(rest.dropFirst(2)))
+        }
+
+        return nil
     }
 }
 

@@ -5,6 +5,17 @@ enum ComposeWindow {
     static let id = "compose"
 }
 
+/// How a compose window divides its space. Persisted, so a preference for
+/// working side by side survives closing the window.
+enum ComposeLayout: String {
+    case editor
+    case split
+    case preview
+
+    var showsEditor: Bool { self != .preview }
+    var showsPreview: Bool { self != .editor }
+}
+
 /// Which surface a previewing compose window shows.
 enum PreviewMode: String {
     /// Native SwiftUI rendering of the same source — see `MarkdownPreview`.
@@ -22,8 +33,12 @@ enum PreviewMode: String {
 struct ComposeView: View {
     @ObservedObject var store: MailStore
     @State private var draft: ComposeDraft
-    @State private var isPreviewing = false
+    @AppStorage("swift-mail.compose.layout") private var layout = ComposeLayout.editor
     @AppStorage("swift-mail.compose.previewMode") private var previewMode = PreviewMode.native
+    /// Trails `draft.markdown`. The recipient preview reloads a `WKWebView`,
+    /// which is far too heavy to redo on every keystroke while typing next to
+    /// it in split view.
+    @State private var debouncedMarkdown: String
     @State private var isSending = false
     @State private var isSaving = false
     @State private var isConfirmingEmptySubject = false
@@ -34,6 +49,7 @@ struct ComposeView: View {
     init(store: MailStore, draft: ComposeDraft) {
         self.store = store
         _draft = State(initialValue: draft)
+        _debouncedMarkdown = State(initialValue: draft.markdown)
     }
 
     var body: some View {
@@ -42,34 +58,35 @@ struct ComposeView: View {
 
             Divider()
 
-            Group {
-                if isPreviewing {
-                    switch previewMode {
-                    case .native:
-                        MarkdownPreview(markdown: draft.markdown)
-                    case .recipient:
-                        HTMLMessageView(
-                            html: MarkdownRenderer.htmlDocument(from: draft.markdown, palette: .wire),
-                            chrome: .opaque
-                        )
-                        .background(Color.white)
-                        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.medium))
-                        .padding(Theme.Spacing.lg)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(Color(nsColor: .underPageBackgroundColor))
-                    }
-                } else {
-                    MarkdownEditor(text: $draft.markdown)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
 
-            ComposeStatusBar(markdown: draft.markdown, status: statusMessage, isPreviewing: isPreviewing, previewMode: $previewMode)
+            ComposeStatusBar(markdown: draft.markdown, status: statusMessage, layout: layout, previewMode: $previewMode)
         }
         .background(Color(nsColor: .textBackgroundColor))
-        .frame(minWidth: 560, minHeight: 440)
+        // Two panes need room to be worth having; the window grows to meet it.
+        .frame(minWidth: layout == .split ? 900 : 560, minHeight: 440)
+        .background {
+            // ⇧⌘P keeps its old meaning — flip between writing and previewing,
+            // returning to the editor from either layout that shows a preview.
+            // It lives here rather than in the toolbar because a hidden
+            // `ToolbarItem` still reserves its slot and draws an empty capsule.
+            Button("Toggle Preview") {
+                layout = layout == .editor ? .preview : .editor
+            }
+            .keyboardShortcut("p", modifiers: [.command, .shift])
+            .hidden()
+        }
+        .task(id: draft.markdown) {
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else {
+                return
+            }
+
+            debouncedMarkdown = draft.markdown
+        }
         .navigationTitle(draft.windowTitle)
         .toolbar { toolbar }
         .task {
@@ -100,6 +117,47 @@ struct ComposeView: View {
         }
     }
 
+    @ViewBuilder
+    private var content: some View {
+        switch layout {
+        case .editor:
+            editor
+        case .preview:
+            preview
+        case .split:
+            // `HSplitView` is the AppKit-backed splitter, so the divider is
+            // draggable and its position persists the way the rest of macOS
+            // behaves — nothing to hand-roll.
+            HSplitView {
+                editor.frame(minWidth: 320)
+                preview.frame(minWidth: 320)
+            }
+        }
+    }
+
+    private var editor: some View {
+        MarkdownEditor(text: $draft.markdown)
+    }
+
+    @ViewBuilder
+    private var preview: some View {
+        switch previewMode {
+        case .native:
+            // Cheap enough to re-render per keystroke, so this one stays live.
+            MarkdownPreview(markdown: draft.markdown)
+        case .recipient:
+            HTMLMessageView(
+                html: MarkdownRenderer.htmlDocument(from: debouncedMarkdown, palette: .wire),
+                chrome: .opaque
+            )
+            .background(Color.white)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.medium))
+            .padding(Theme.Spacing.lg)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .underPageBackgroundColor))
+        }
+    }
+
     // macOS 26 toolbar items are glass by default and merge into one shared
     // capsule when adjacent — that's what gives Mail's toolbar its segmented
     // look. Forcing `.buttonStyle(.glass)` on each button (the previous code
@@ -110,14 +168,16 @@ struct ComposeView: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItem {
-            Button {
-                isPreviewing.toggle()
-            } label: {
-                Label(isPreviewing ? "Edit" : "Preview", systemImage: isPreviewing ? "pencil" : "eye")
+            Picker("Layout", selection: $layout) {
+                Label("Editor", systemImage: "pencil").tag(ComposeLayout.editor)
+                Label("Split", systemImage: "rectangle.split.2x1").tag(ComposeLayout.split)
+                Label("Preview", systemImage: "eye").tag(ComposeLayout.preview)
             }
-            .help(isPreviewing ? "Back to Markdown (⇧⌘P)" : "Preview rendered message (⇧⌘P)")
-            .keyboardShortcut("p", modifiers: [.command, .shift])
+            .pickerStyle(.segmented)
+            .labelStyle(.iconOnly)
+            .help("Editor, side by side, or preview")
         }
+
 
         ToolbarSpacer(.flexible)
 
@@ -301,12 +361,14 @@ private struct ComposeFieldRow<Content: View>: View {
 private struct ComposeStatusBar: View {
     let markdown: String
     let status: String?
-    let isPreviewing: Bool
+    let layout: ComposeLayout
     @Binding var previewMode: PreviewMode
 
     var body: some View {
         HStack(spacing: Theme.Spacing.md) {
-            if isPreviewing {
+            // Split shows both: the preview needs its mode picker and the
+            // editor still needs its shortcuts.
+            if layout.showsPreview {
                 Picker("Preview", selection: $previewMode) {
                     Text("Preview").tag(PreviewMode.native)
                     Text("As Recipient Sees It").tag(PreviewMode.recipient)
@@ -314,7 +376,9 @@ private struct ComposeStatusBar: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .fixedSize()
-            } else {
+            }
+
+            if layout.showsEditor {
                 Label("Markdown", systemImage: "textformat")
                     .labelStyle(.titleAndIcon)
                     .foregroundStyle(.secondary)
@@ -343,7 +407,7 @@ private struct ComposeStatusBar: View {
     }
 
     private var shortcutHint: String {
-        "⌘B bold · ⌘I italic · ⌘K link · ⇧⌘C code"
+        "⌘1–3 headings · ⇧⌘L list · ⇧⌘O numbered · ⌘' quote · ⌘B bold · ⌘I italic · ⌘K link · ⇧⌘C code"
     }
 
     private var wordCount: Int {
