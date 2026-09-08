@@ -80,6 +80,9 @@ final class MailStore: ObservableObject {
     private var bearerToken: String?
     private var autoFetchTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
+    /// The mailbox the messages currently on screen were fetched for, which is
+    /// not the same as the selected one while a switch is in flight.
+    private var loadedMailboxID: Mailbox.ID?
     /// The last-seen server state per JMAP type, so background syncs ask the
     /// server only for what changed (`Email/changes`) instead of re-querying.
     private var emailState: String?
@@ -194,6 +197,7 @@ final class MailStore: ObservableObject {
         mailboxState = nil
         mailboxes = []
         emails = []
+        loadedMailboxID = nil
         selectedEmail = nil
         selectedMailboxID = nil
         selectedEmailID = nil
@@ -214,6 +218,7 @@ final class MailStore: ObservableObject {
         mailboxState = nil
         mailboxes = []
         emails = []
+        loadedMailboxID = nil
         selectedEmail = nil
         selectedMailboxID = nil
         selectedEmailID = nil
@@ -270,6 +275,18 @@ final class MailStore: ObservableObject {
             searchText = ""
         }
 
+        // `selectedMailboxID` is no use for spotting a folder change: the
+        // sidebar's selection binding has already written the new id before
+        // `onChange` gets here. Comparing against the folder the on-screen
+        // messages actually came from is what distinguishes a genuine switch
+        // from a re-query of the same folder (search, refresh, retry).
+        if mailboxID != loadedMailboxID {
+            // Dropping the old folder's messages is what lets the skeleton show
+            // straight away, instead of the previous folder sitting there until
+            // the new page lands.
+            emails = []
+        }
+
         selectedMailboxID = mailboxID
         isLoadingEmails = true
         selectedEmail = nil
@@ -290,17 +307,22 @@ final class MailStore: ObservableObject {
 
             emails = page.previews
             applyPageMetadata(page)
+            loadedMailboxID = mailboxID
             selectedEmailID = emails.first?.id
+
+            // The list has what it needs now; the reader's fetch is a separate
+            // wait and shouldn't hold the message list behind the skeleton.
+            isLoadingEmails = false
 
             if let selectedEmailID {
                 await loadEmailDetail(emailID: selectedEmailID)
             }
         } catch {
             emails = []
+            loadedMailboxID = mailboxID
             emailsErrorMessage = error.localizedDescription
+            isLoadingEmails = false
         }
-
-        isLoadingEmails = false
     }
 
     /// Appends the next page of the current mailbox/search listing.
