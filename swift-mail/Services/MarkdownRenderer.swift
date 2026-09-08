@@ -14,26 +14,54 @@ import Foundation
 /// composer has no reason to emit tags the user did not ask for, and escaping
 /// keeps a pasted snippet from rewriting the message around it.
 nonisolated enum MarkdownRenderer {
+    /// The color palette in effect for the render currently on the stack.
+    ///
+    /// Threading a parameter through `BlockScanner`/`InlineScanner` for a value
+    /// that never changes mid-render would mean touching every recursive call
+    /// site; a task-local reads cleanly from `Style` instead while staying just
+    /// as concurrency-safe, since `Palette` is an immutable `Sendable` value.
+    @TaskLocal fileprivate static var palette: Palette = .wire
+
     /// An HTML fragment, suitable for embedding in a message body.
-    static func bodyHTML(from markdown: String) -> String {
-        var scanner = BlockScanner(markdown: markdown)
-        return scanner.render()
+    static func bodyHTML(from markdown: String, palette: Palette = .wire) -> String {
+        Self.$palette.withValue(palette) {
+            var scanner = BlockScanner(markdown: markdown)
+            return scanner.render()
+        }
     }
 
-    /// A full document, used for the compose preview and as the `text/html` part.
-    static func htmlDocument(from markdown: String) -> String {
-        """
-        <!doctype html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-        </head>
-        <body style="\(Style.body)">
-        \(bodyHTML(from: markdown))
-        </body>
-        </html>
-        """
+    /// A full document. `palette` defaults to `.wire`, the colors that actually
+    /// ship in the `text/html` part; the compose preview passes `.preview` so it
+    /// reads correctly in both appearances instead of showing the wire colors
+    /// against the window's own background.
+    static func htmlDocument(from markdown: String, palette: Palette = .wire) -> String {
+        Self.$palette.withValue(palette) {
+            """
+            <!doctype html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <meta name="color-scheme" content="light dark">
+                <style>
+                    :root { color-scheme: light dark; }
+                    @media (prefers-color-scheme: dark) {
+                        body { color: \(Palette.wireDark.text) !important; }
+                        blockquote { color: \(Palette.wireDark.secondaryText) !important; border-left-color: \(Palette.wireDark.rule) !important; }
+                        hr { border-top-color: \(Palette.wireDark.rule) !important; }
+                        pre, code { background: \(Palette.wireDark.surface) !important; }
+                        a { color: \(Palette.wireDark.link) !important; }
+                        th, td { border-color: \(Palette.wireDark.rule) !important; }
+                        th { background: \(Palette.wireDark.surface) !important; }
+                    }
+                </style>
+            </head>
+            <body style="\(Style.body)">
+            \(bodyHTML(from: markdown, palette: palette))
+            </body>
+            </html>
+            """
+        }
     }
 
     /// The `text/plain` alternative. Markdown *is* the plain text representation,
@@ -45,24 +73,72 @@ nonisolated enum MarkdownRenderer {
     }
 }
 
+// MARK: - Palette
+
+extension MarkdownRenderer {
+    /// The colors an emitted document's inline styles carry.
+    ///
+    /// `.wire` is explicit hex because mail clients routinely strip `<style>`
+    /// blocks — see the file-level note above — so the inline styles need to
+    /// stand alone. `.preview` uses AppKit's semantic system colors, valid only
+    /// because the preview always renders inside our own `WKWebView`, never in
+    /// a recipient's mail client.
+    nonisolated struct Palette: Sendable {
+        let text: String
+        let secondaryText: String
+        let rule: String
+        let surface: String
+        let link: String
+
+        static let wire = Palette(
+            text: "#1d1d1f",
+            secondaryText: "#515154",
+            rule: "#d2d2d7",
+            surface: "#f5f5f7",
+            link: "#0066cc"
+        )
+
+        /// The dark-mode variant of `.wire`, used only inside the `<style>`
+        /// override on the outgoing document — inline styles stay `.wire`
+        /// verbatim as the no-CSS fallback.
+        fileprivate static let wireDark = Palette(
+            text: "#f5f5f7",
+            secondaryText: "#a1a1a6",
+            rule: "#48484a",
+            surface: "#2c2c2e",
+            link: "#409cff"
+        )
+
+        static let preview = Palette(
+            text: "-apple-system-label",
+            secondaryText: "-apple-system-secondary-label",
+            rule: "-apple-system-separator",
+            surface: "color-mix(in srgb, currentColor 8%, transparent)",
+            link: "-apple-system-blue"
+        )
+    }
+}
+
 // MARK: - Styling
 
 extension MarkdownRenderer {
     nonisolated enum Style {
-        static let body = "margin:0;font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#1d1d1f;"
+        private static var palette: Palette { MarkdownRenderer.palette }
+
+        static var body: String { "margin:0;font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:\(palette.text);" }
         static let paragraph = "margin:0 0 12px 0;"
         static let list = "margin:0 0 12px 0;padding-left:24px;"
         static let listItem = "margin:0 0 4px 0;"
-        static let blockquote = "margin:0 0 12px 0;padding:2px 0 2px 12px;border-left:3px solid #d2d2d7;color:#515154;"
-        static let codeBlock = "margin:0 0 12px 0;padding:10px 12px;background:#f5f5f7;border-radius:6px;white-space:pre-wrap;"
+        static var blockquote: String { "margin:0 0 12px 0;padding:2px 0 2px 12px;border-left:3px solid \(palette.rule);color:\(palette.secondaryText);" }
+        static var codeBlock: String { "margin:0 0 12px 0;padding:10px 12px;background:\(palette.surface);border-radius:6px;white-space:pre-wrap;" }
         static let code = "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;"
-        static let codeSpan = "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;background:#f5f5f7;border-radius:4px;padding:1px 4px;"
-        static let rule = "border:0;border-top:1px solid #d2d2d7;margin:20px 0;"
-        static let link = "color:#0066cc;"
+        static var codeSpan: String { "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;background:\(palette.surface);border-radius:4px;padding:1px 4px;" }
+        static var rule: String { "border:0;border-top:1px solid \(palette.rule);margin:20px 0;" }
+        static var link: String { "color:\(palette.link);" }
         static let image = "max-width:100%;height:auto;"
         static let table = "border-collapse:collapse;margin:0 0 12px 0;"
-        static let tableHeaderCell = "border:1px solid #d2d2d7;padding:6px 10px;background:#f5f5f7;font-weight:600;"
-        static let tableCell = "border:1px solid #d2d2d7;padding:6px 10px;"
+        static var tableHeaderCell: String { "border:1px solid \(palette.rule);padding:6px 10px;background:\(palette.surface);font-weight:600;" }
+        static var tableCell: String { "border:1px solid \(palette.rule);padding:6px 10px;" }
 
         static func heading(level: Int) -> String {
             let size: String
@@ -133,15 +209,36 @@ nonisolated private struct BlockScanner {
         index < lines.count ? lines[index] : nil
     }
 
-    /// True when the line would begin a block other than the paragraph currently
-    /// being gathered, which is what terminates lazy continuation.
-    private func startsNewBlock(_ line: String) -> Bool {
-        line.isBlankLine
+    /// True when the line at `index` would begin a block other than the
+    /// paragraph currently being gathered, which is what terminates lazy
+    /// continuation.
+    private func startsNewBlock(at index: Int) -> Bool {
+        guard index < lines.count else {
+            return false
+        }
+
+        let line = lines[index]
+
+        if line.isBlankLine
             || line.isThematicBreak
             || line.isBlockquote
             || CodeFence(line: line) != nil
             || Heading(line: line) != nil
-            || ListMarker(line: line) != nil
+            || ListMarker(line: line) != nil {
+            return true
+        }
+
+        // A GFM table's header row is otherwise indistinguishable from a plain
+        // paragraph line, so a table written directly after a paragraph (no
+        // blank line between) would silently be swallowed into it. Only the
+        // delimiter row on the *next* line proves this one starts a table.
+        if line.contains("|"), index + 1 < lines.count,
+           let alignments = TableAlignment.parseDelimiterRow(lines[index + 1]),
+           line.tableCells().count == alignments.count {
+            return true
+        }
+
+        return false
     }
 
     private mutating func renderCodeBlock(opening: CodeFence) -> String {
@@ -175,7 +272,7 @@ nonisolated private struct BlockScanner {
             }
 
             // Lazy continuation: an unmarked line still belongs to the quote.
-            if !startsNewBlock(line), !quoted.isEmpty {
+            if !startsNewBlock(at: index), !quoted.isEmpty {
                 quoted.append(line)
                 index += 1
                 continue
@@ -319,7 +416,7 @@ nonisolated private struct BlockScanner {
         var rendered: [String] = []
 
         while let line = peek() {
-            if !rendered.isEmpty, startsNewBlock(line) {
+            if !rendered.isEmpty, startsNewBlock(at: index) {
                 break
             }
 
@@ -392,9 +489,12 @@ nonisolated private struct Heading {
         }
 
         level = hashes.count
-        text = remainder
-            .trimmingCharacters(in: .whitespaces)
-            .drop { $0 == "#" }
+
+        // An ATX heading may carry an optional closing sequence of hashes
+        // (`## Heading ##`) — trailing, not leading, so a leading `#` such as
+        // in `# #tag` is content and must survive.
+        let trimmedRemainder = remainder.trimmingCharacters(in: .whitespaces)
+        text = String(trimmedRemainder.reversed().drop { $0 == "#" }.reversed())
             .trimmingCharacters(in: .whitespaces)
     }
 
@@ -559,7 +659,7 @@ nonisolated private enum InlineScanner {
                     index += 1
                 }
 
-            case "h", "w":
+            case "h", "w", "H", "W":
                 if let bare = bareURL(characters, from: index) {
                     output += bare.html
                     index = bare.next
@@ -626,6 +726,11 @@ nonisolated private enum InlineScanner {
             tag = "del"
         case ("~", _):
             return nil
+        case (_, 3):
+            // A run of exactly three is bold-and-italic together
+            // (`***text***`), not `strong` with a stray leftover marker.
+            delimiterLength = 3
+            tag = "strong+em"
         case (_, 2...):
             delimiterLength = 2
             tag = "strong"
@@ -669,7 +774,10 @@ nonisolated private enum InlineScanner {
             }
 
             let content = String(characters[contentStart..<index])
-            return ("<\(tag)>\(render(content))</\(tag)>", index + delimiterLength)
+            let html = tag == "strong+em"
+                ? "<strong><em>\(render(content))</em></strong>"
+                : "<\(tag)>\(render(content))</\(tag)>"
+            return (html, index + delimiterLength)
         }
 
         return nil
@@ -715,10 +823,29 @@ nonisolated private enum InlineScanner {
         return (html, end + 1)
     }
 
+    private static let bareURLSchemes = ["https://", "http://", "www."]
+
+    /// Case-insensitive prefix check against `bareURLSchemes` that only ever
+    /// compares a handful of characters, unlike materializing
+    /// `String(characters[start...])` on every `h`/`w` character in the
+    /// document, which made linkifying long bodies quadratic.
+    private static func matchingScheme(_ characters: [Character], at start: Int) -> String? {
+        bareURLSchemes.first { scheme in
+            let schemeChars = Array(scheme)
+            guard start + schemeChars.count <= characters.count else {
+                return false
+            }
+
+            for offset in 0..<schemeChars.count where characters[start + offset].lowercased() != schemeChars[offset].lowercased() {
+                return false
+            }
+
+            return true
+        }
+    }
+
     private static func bareURL(_ characters: [Character], from start: Int) -> (html: String, next: Int)? {
-        let remainder = String(characters[start...])
-        let scheme = ["https://", "http://", "www."].first { remainder.hasPrefix($0) }
-        guard scheme != nil else {
+        guard let scheme = matchingScheme(characters, at: start) else {
             return nil
         }
 
@@ -733,7 +860,12 @@ nonisolated private enum InlineScanner {
         }
 
         let text = String(characters[start..<end])
-        guard text.count > 8, let url = SafeURL(text.hasPrefix("www.") ? "https://\(text)" : text) else {
+
+        // Require something beyond the bare scheme itself, so `http://` or
+        // `www.` alone isn't linkified — but a short real host like `www.a.co`
+        // still qualifies, unlike the old flat "more than 8 characters" gate.
+        guard text.count > scheme.count,
+              let url = SafeURL(text.lowercased().hasPrefix("www.") ? "https://\(text)" : text) else {
             return nil
         }
 

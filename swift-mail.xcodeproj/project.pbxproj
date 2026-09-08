@@ -6,8 +6,19 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXContainerItemProxy section */
+		CD91DFBA5CBF46DD8CE360D6 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 12FB948E2FCFB54000763959 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 12FB94952FCFB54000763959;
+			remoteInfo = "swift-mail";
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		12FB94962FCFB54000763959 /* swift-mail.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "swift-mail.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		F6F06ABFAFB13D94456CDDFA /* swift-mailTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "swift-mailTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -16,10 +27,22 @@
 			path = "swift-mail";
 			sourceTree = "<group>";
 		};
+		1E5254159CD56119D744F276 /* swift-mailTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "swift-mailTests";
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		12FB94932FCFB54000763959 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		70EE79588189F5B2EA84A8FF /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -33,6 +56,7 @@
 			isa = PBXGroup;
 			children = (
 				12FB94982FCFB54000763959 /* swift-mail */,
+				1E5254159CD56119D744F276 /* swift-mailTests */,
 				12FB94972FCFB54000763959 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,6 +65,7 @@
 			isa = PBXGroup;
 			children = (
 				12FB94962FCFB54000763959 /* swift-mail.app */,
+				F6F06ABFAFB13D94456CDDFA /* swift-mailTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -70,6 +95,29 @@
 			productReference = 12FB94962FCFB54000763959 /* swift-mail.app */;
 			productType = "com.apple.product-type.application";
 		};
+		3E56F041470DD30E2CDCDDF1 /* swift-mailTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6278E8381513F4ECCD360846 /* Build configuration list for PBXNativeTarget "swift-mailTests" */;
+			buildPhases = (
+				6909D8D1C9B0253D561A5634 /* Sources */,
+				70EE79588189F5B2EA84A8FF /* Frameworks */,
+				199F64C24B6A1D60FF6B2A77 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				58AAAE1DCB1BEEC2B35EAAD0 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				1E5254159CD56119D744F276 /* swift-mailTests */,
+			);
+			name = "swift-mailTests";
+			packageProductDependencies = (
+			);
+			productName = "swift-mailTests";
+			productReference = F6F06ABFAFB13D94456CDDFA /* swift-mailTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -82,6 +130,10 @@
 				TargetAttributes = {
 					12FB94952FCFB54000763959 = {
 						CreatedOnToolsVersion = 26.5;
+					};
+					3E56F041470DD30E2CDCDDF1 = {
+						CreatedOnToolsVersion = 26.5;
+						TestTargetID = 12FB94952FCFB54000763959;
 					};
 				};
 			};
@@ -100,12 +152,20 @@
 			projectRoot = "";
 			targets = (
 				12FB94952FCFB54000763959 /* swift-mail */,
+				3E56F041470DD30E2CDCDDF1 /* swift-mailTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		12FB94942FCFB54000763959 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		199F64C24B6A1D60FF6B2A77 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -122,7 +182,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		6909D8D1C9B0253D561A5634 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		58AAAE1DCB1BEEC2B35EAAD0 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 12FB94952FCFB54000763959 /* swift-mail */;
+			targetProxy = CD91DFBA5CBF46DD8CE360D6 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		12FB949F2FCFB54100763959 /* Debug */ = {
@@ -313,6 +388,40 @@
 			};
 			name = Release;
 		};
+		C77D11319BA0D8ACCC28AD5C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = TJPPG7V2RJ;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "declan-wade.swift-mail.swift-mailTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/swift-mail.app/Contents/MacOS/swift-mail";
+			};
+			name = Debug;
+		};
+		53956B2FB0373A5F5FBA7471 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = TJPPG7V2RJ;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "declan-wade.swift-mail.swift-mailTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/swift-mail.app/Contents/MacOS/swift-mail";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -330,6 +439,15 @@
 			buildConfigurations = (
 				12FB94A22FCFB54100763959 /* Debug */,
 				12FB94A32FCFB54100763959 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		6278E8381513F4ECCD360846 /* Build configuration list for PBXNativeTarget "swift-mailTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C77D11319BA0D8ACCC28AD5C /* Debug */,
+				53956B2FB0373A5F5FBA7471 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

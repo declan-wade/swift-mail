@@ -14,6 +14,8 @@ final class MailStore: ObservableObject {
     @Published var isLoadingEmails = false
     @Published var isLoadingSelectedEmail = false
     @Published var updatingReadStateEmailIDs: Set<EmailPreview.ID> = []
+    @Published var updatingFlagEmailIDs: Set<EmailPreview.ID> = []
+    @Published var movingEmailIDs: Set<EmailPreview.ID> = []
     @Published var identities: [MailIdentity] = []
     @Published var errorMessage: String?
 
@@ -198,6 +200,67 @@ final class MailStore: ObservableObject {
     func toggleReadState(emailID: EmailPreview.ID) async {
         let isUnread = emails.first { $0.id == emailID }?.isUnread ?? selectedEmail?.isUnread ?? false
         await setReadState(emailID: emailID, isRead: isUnread)
+    }
+
+    func toggleFlag(emailID: EmailPreview.ID) async {
+        guard !updatingFlagEmailIDs.contains(emailID),
+              let client = makeClient(),
+              let session,
+              let accountID else {
+            return
+        }
+
+        let wasFlagged = emails.first { $0.id == emailID }?.isFlagged ?? selectedEmail?.isFlagged ?? false
+        let isFlagged = !wasFlagged
+
+        updatingFlagEmailIDs.insert(emailID)
+        errorMessage = nil
+
+        do {
+            try await client.setEmailKeyword(session: session, accountID: accountID, emailID: emailID, keyword: "$flagged", isSet: isFlagged)
+            applyFlagState(emailID: emailID, isFlagged: isFlagged)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+
+        updatingFlagEmailIDs.remove(emailID)
+    }
+
+    /// Moves an email to the mailbox for `role` (`"archive"` or `"trash"`) and,
+    /// on success, advances the list selection so the detail pane doesn't go
+    /// blank. Mirrors `setReadState`'s optimistic-update-then-roll-back shape.
+    func moveEmail(emailID: EmailPreview.ID, toRole role: String) async {
+        guard !movingEmailIDs.contains(emailID),
+              let client = makeClient(),
+              let session,
+              let accountID else {
+            return
+        }
+
+        guard let destination = mailbox(role: role) else {
+            errorMessage = JMAPError.missingMailbox(role.capitalized).localizedDescription
+            return
+        }
+
+        movingEmailIDs.insert(emailID)
+        errorMessage = nil
+
+        do {
+            try await client.moveEmail(session: session, accountID: accountID, emailID: emailID, toMailboxID: destination.id)
+            applyMove(emailID: emailID)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+
+        movingEmailIDs.remove(emailID)
+    }
+
+    func archive(emailID: EmailPreview.ID) async {
+        await moveEmail(emailID: emailID, toRole: "archive")
+    }
+
+    func delete(emailID: EmailPreview.ID) async {
+        await moveEmail(emailID: emailID, toRole: "trash")
     }
 
     // MARK: - Compose
@@ -434,6 +497,48 @@ final class MailStore: ObservableObject {
         }
 
         updateSelectedMailboxUnreadCount(wasUnread: wasUnread, isUnread: !isRead)
+    }
+
+    private func applyFlagState(emailID: EmailPreview.ID, isFlagged: Bool) {
+        emails = emails.map { email in
+            guard email.id == emailID else {
+                return email
+            }
+
+            return email.settingFlagged(isFlagged)
+        }
+
+        if selectedEmail?.id == emailID {
+            selectedEmail = selectedEmail?.settingFlagged(isFlagged)
+        }
+    }
+
+    /// Removes the email from the currently displayed list and, if it was
+    /// selected, advances to its neighbor rather than leaving the reading
+    /// pane empty.
+    private func applyMove(emailID: EmailPreview.ID) {
+        let wasSelected = selectedEmailID == emailID
+        let removedIndex = emails.firstIndex { $0.id == emailID }
+
+        emails.removeAll { $0.id == emailID }
+
+        guard wasSelected else {
+            return
+        }
+
+        guard let removedIndex, !emails.isEmpty else {
+            selectedEmailID = nil
+            selectedEmail = nil
+            return
+        }
+
+        let nextIndex = min(removedIndex, emails.count - 1)
+        let nextEmailID = emails[nextIndex].id
+        selectedEmailID = nextEmailID
+
+        Task {
+            await loadEmailDetail(emailID: nextEmailID)
+        }
     }
 
     private func updateSelectedMailboxUnreadCount(wasUnread: Bool, isUnread: Bool) {

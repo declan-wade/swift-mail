@@ -8,14 +8,19 @@ struct AccountSetupView: View {
     @State private var bearerToken = ""
     @State private var setupError: String?
     @State private var isSaving = false
+    @FocusState private var focusedField: Field?
+
+    private enum Field: Hashable {
+        case displayName, sessionAddress, bearerToken
+    }
 
     var body: some View {
-        VStack(spacing: 24) {
+        VStack(spacing: Theme.Spacing.xl) {
             Image(systemName: "envelope.badge.shield.half.filled")
                 .font(.system(size: 44))
                 .foregroundStyle(.tint)
 
-            VStack(spacing: 8) {
+            VStack(spacing: Theme.Spacing.sm) {
                 Text("Set Up JMAP Mail")
                     .font(.title)
                     .fontWeight(.semibold)
@@ -26,9 +31,22 @@ struct AccountSetupView: View {
 
             Form {
                 TextField("Account name", text: $displayName)
+                    .focused($focusedField, equals: .displayName)
+                    .onSubmit { focusedField = .sessionAddress }
+                    .submitLabel(.next)
+
                 TextField("JMAP session URL", text: $sessionAddress)
                     .textContentType(.URL)
+                    .focused($focusedField, equals: .sessionAddress)
+                    .onSubmit { focusedField = .bearerToken }
+                    .submitLabel(.next)
+
                 SecureField("Bearer token", text: $bearerToken)
+                    .focused($focusedField, equals: .bearerToken)
+                    .onSubmit {
+                        Task { await saveAndConnect() }
+                    }
+                    .submitLabel(.go)
             }
             .formStyle(.grouped)
             .frame(maxWidth: 460)
@@ -59,6 +77,9 @@ struct AccountSetupView: View {
         }
         .padding(40)
         .frame(minWidth: 560, minHeight: 420)
+        .onAppear {
+            focusedField = .displayName
+        }
     }
 
     private func saveAndConnect() async {

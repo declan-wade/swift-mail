@@ -152,7 +152,15 @@ final class JMAPClient {
     }
 
     func setEmailSeen(session: JMAPSession, accountID: String, emailID: String, isSeen: Bool) async throws {
-        let seenPatchValue: Any = isSeen ? true : NSNull()
+        try await setEmailKeyword(session: session, accountID: accountID, emailID: emailID, keyword: "$seen", isSet: isSeen)
+    }
+
+    /// Sets or clears a single JMAP keyword (`$seen`, `$flagged`, …) on one
+    /// email. A patch path lets the update touch only that keyword — an
+    /// `Email/set` full `keywords` replacement would race any other client
+    /// changing a different keyword at the same time.
+    func setEmailKeyword(session: JMAPSession, accountID: String, emailID: String, keyword: String, isSet: Bool) async throws {
+        let patchValue: Any = isSet ? true : NSNull()
         let response = try await call(
             apiURL: session.apiURL,
             methodCalls: [
@@ -162,16 +170,45 @@ final class JMAPClient {
                         "accountId": accountID,
                         "update": [
                             emailID: [
-                                "keywords/$seen": seenPatchValue
+                                "keywords/\(keyword)": patchValue
                             ]
                         ]
                     ],
-                    "setEmailSeen"
+                    "setEmailKeyword"
                 ]
             ]
         )
 
-        let payload = try response.payload(named: "Email/set", clientID: "setEmailSeen")
+        let payload = try response.payload(named: "Email/set", clientID: "setEmailKeyword")
+        if let notUpdated = payload["notUpdated"] as? [String: Any], !notUpdated.isEmpty {
+            throw JMAPError.methodError("emailNotUpdated")
+        }
+    }
+
+    /// Moves an email to a single destination mailbox, replacing its
+    /// `mailboxIds` entirely. That matches how Mail treats archive/delete —
+    /// the message leaves every mailbox it was filed under and lands in
+    /// exactly one — rather than layering the destination on top.
+    func moveEmail(session: JMAPSession, accountID: String, emailID: String, toMailboxID mailboxID: String) async throws {
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "Email/set",
+                    [
+                        "accountId": accountID,
+                        "update": [
+                            emailID: [
+                                "mailboxIds": [mailboxID: true]
+                            ]
+                        ]
+                    ],
+                    "moveEmail"
+                ]
+            ]
+        )
+
+        let payload = try response.payload(named: "Email/set", clientID: "moveEmail")
         if let notUpdated = payload["notUpdated"] as? [String: Any], !notUpdated.isEmpty {
             throw JMAPError.methodError("emailNotUpdated")
         }

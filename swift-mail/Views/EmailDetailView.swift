@@ -22,7 +22,7 @@ struct EmailDetailView: View {
                 ContentUnavailableView("Select a Message", systemImage: "envelope.open")
             }
         }
-        .navigationSplitViewColumnWidth(min: 420, ideal: 680)
+        .navigationSplitViewColumnWidth(min: Theme.Column.detail.min, ideal: Theme.Column.detail.ideal)
     }
 }
 
@@ -31,19 +31,27 @@ private struct ReaderHeader: View {
     @ObservedObject var store: MailStore
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(email.subjectLine)
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                    .textSelection(.enabled)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
+            VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+                HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.sm) {
+                    Text(email.subjectLine)
+                        .font(.title2)
+                        .fontWeight(.semibold)
+                        .textSelection(.enabled)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
 
-                HStack(alignment: .top, spacing: 12) {
+                    if email.isFlagged {
+                        Image(systemName: "flag.fill")
+                            .foregroundStyle(.orange)
+                            .accessibilityLabel("Flagged")
+                    }
+                }
+
+                HStack(alignment: .top, spacing: Theme.Spacing.md) {
                     SenderAvatar(name: email.from?.first?.name, email: email.from?.first?.email)
 
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
                         Text(email.senderLine)
                             .font(.headline)
                             .textSelection(.enabled)
@@ -64,9 +72,9 @@ private struct ReaderHeader: View {
                 }
             }
         }
-        .padding(.horizontal, 28)
-        .padding(.top, 16)
-        .padding(.bottom, 20)
+        .padding(.horizontal, Theme.Spacing.xxl)
+        .padding(.top, Theme.Spacing.lg)
+        .padding(.bottom, Theme.Spacing.xl)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.bar)
     }
@@ -86,7 +94,7 @@ private struct SenderAvatar: View {
                 .fontWeight(.semibold)
                 .foregroundStyle(.tint)
         }
-        .frame(width: 36, height: 36)
+        .frame(width: Theme.Size.avatar, height: Theme.Size.avatar)
         .accessibilityHidden(true)
     }
 

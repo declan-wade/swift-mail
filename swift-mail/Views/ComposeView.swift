@@ -5,6 +5,15 @@ enum ComposeWindow {
     static let id = "compose"
 }
 
+/// Which surface a previewing compose window shows.
+enum PreviewMode: String {
+    /// Native SwiftUI rendering of the same source — see `MarkdownPreview`.
+    case native
+    /// The actual outgoing HTML, rendered in a `WKWebView` on its own opaque
+    /// page so it reads the same regardless of the app's own appearance.
+    case recipient
+}
+
 /// A single compose window.
 ///
 /// The draft is window-local `@State` seeded from the value the window was opened
@@ -14,6 +23,7 @@ struct ComposeView: View {
     @ObservedObject var store: MailStore
     @State private var draft: ComposeDraft
     @State private var isPreviewing = false
+    @AppStorage("swift-mail.compose.previewMode") private var previewMode = PreviewMode.native
     @State private var isSending = false
     @State private var isSaving = false
     @State private var isConfirmingEmptySubject = false
@@ -34,7 +44,20 @@ struct ComposeView: View {
 
             Group {
                 if isPreviewing {
-                    HTMLMessageView(html: MarkdownRenderer.htmlDocument(from: draft.markdown))
+                    switch previewMode {
+                    case .native:
+                        MarkdownPreview(markdown: draft.markdown)
+                    case .recipient:
+                        HTMLMessageView(
+                            html: MarkdownRenderer.htmlDocument(from: draft.markdown, palette: .wire),
+                            chrome: .opaque
+                        )
+                        .background(Color.white)
+                        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.medium))
+                        .padding(Theme.Spacing.lg)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(nsColor: .underPageBackgroundColor))
+                    }
                 } else {
                     MarkdownEditor(text: $draft.markdown)
                 }
@@ -43,7 +66,7 @@ struct ComposeView: View {
 
             Divider()
 
-            ComposeStatusBar(markdown: draft.markdown, status: statusMessage)
+            ComposeStatusBar(markdown: draft.markdown, status: statusMessage, isPreviewing: isPreviewing, previewMode: $previewMode)
         }
         .background(Color(nsColor: .textBackgroundColor))
         .frame(minWidth: 560, minHeight: 440)
@@ -77,9 +100,16 @@ struct ComposeView: View {
         }
     }
 
+    // macOS 26 toolbar items are glass by default and merge into one shared
+    // capsule when adjacent — that's what gives Mail's toolbar its segmented
+    // look. Forcing `.buttonStyle(.glass)` on each button (the previous code
+    // here) opts every one of them *out* of that merging, which is what
+    // produced a row of disconnected pills instead. `ToolbarSpacer` is the
+    // supported way to separate groups; only Send keeps an explicit style,
+    // since `.glassProminent` is a deliberate visual departure, not a fix.
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        ToolbarItemGroup {
+        ToolbarItem {
             Button {
                 isPreviewing.toggle()
             } label: {
@@ -87,8 +117,11 @@ struct ComposeView: View {
             }
             .help(isPreviewing ? "Back to Markdown (⇧⌘P)" : "Preview rendered message (⇧⌘P)")
             .keyboardShortcut("p", modifiers: [.command, .shift])
-            .buttonStyle(.glass)
+        }
 
+        ToolbarSpacer(.flexible)
+
+        ToolbarItem {
             Button {
                 Task { await performSaveDraft() }
             } label: {
@@ -97,8 +130,9 @@ struct ComposeView: View {
             .help("Save Draft (⌘S)")
             .keyboardShortcut("s", modifiers: .command)
             .disabled(isSending || isSaving)
-            .buttonStyle(.glass)
+        }
 
+        ToolbarItem {
             Button {
                 requestSend()
             } label: {
@@ -194,7 +228,7 @@ private struct ComposeHeader: View {
             }
 
             ComposeFieldRow(label: "To") {
-                HStack(spacing: 8) {
+                HStack(spacing: Theme.Spacing.sm) {
                     RecipientField(addresses: $draft.to, placeholder: "")
 
                     Button {
@@ -243,20 +277,20 @@ private struct ComposeFieldRow<Content: View>: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.md - 2) {
                 Text(label)
                     .foregroundStyle(.secondary)
-                    .frame(width: 56, alignment: .trailing)
+                    .frame(width: Theme.Size.fieldLabel, alignment: .trailing)
 
                 content
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 7)
+            .padding(.horizontal, Theme.Spacing.lg)
+            .padding(.vertical, Theme.Spacing.sm - 1)
 
             if showsDivider {
                 Divider()
-                    .padding(.leading, 16)
+                    .padding(.leading, Theme.Spacing.lg)
             }
         }
     }
@@ -267,19 +301,31 @@ private struct ComposeFieldRow<Content: View>: View {
 private struct ComposeStatusBar: View {
     let markdown: String
     let status: String?
+    let isPreviewing: Bool
+    @Binding var previewMode: PreviewMode
 
     var body: some View {
-        HStack(spacing: 12) {
-            Label("Markdown", systemImage: "textformat")
-                .labelStyle(.titleAndIcon)
-                .foregroundStyle(.secondary)
+        HStack(spacing: Theme.Spacing.md) {
+            if isPreviewing {
+                Picker("Preview", selection: $previewMode) {
+                    Text("Preview").tag(PreviewMode.native)
+                    Text("As Recipient Sees It").tag(PreviewMode.recipient)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+            } else {
+                Label("Markdown", systemImage: "textformat")
+                    .labelStyle(.titleAndIcon)
+                    .foregroundStyle(.secondary)
 
-            Text(shortcutHint)
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
-                .truncationMode(.tail)
+                Text(shortcutHint)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
 
-            Spacer(minLength: 8)
+            Spacer(minLength: Theme.Spacing.sm)
 
             if let status {
                 Text(status)
@@ -291,8 +337,8 @@ private struct ComposeStatusBar: View {
                 .monospacedDigit()
         }
         .font(.caption)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 6)
+        .padding(.horizontal, Theme.Spacing.lg)
+        .padding(.vertical, Theme.Spacing.sm - 2)
         .background(.bar)
     }
 

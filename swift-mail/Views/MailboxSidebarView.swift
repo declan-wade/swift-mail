@@ -24,7 +24,7 @@ struct MailboxSidebarView: View {
                 }
             }
         }
-        .navigationSplitViewColumnWidth(min: 180, ideal: 220)
+        .navigationSplitViewColumnWidth(min: Theme.Column.sidebar.min, ideal: Theme.Column.sidebar.ideal)
         .onChange(of: store.selectedMailboxID) { _, mailboxID in
             guard let mailboxID else {
                 return

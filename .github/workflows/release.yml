@@ -1,0 +1,98 @@
+name: Build and Release
+
+# Builds the macOS app and attaches it to a GitHub Release.
+#
+# - Publishing a release (or pushing a `v*` tag, which auto-drafts one below)
+#   triggers a build and uploads the .app, zipped, as a release asset.
+# - `workflow_dispatch` lets you run the build on demand (e.g. to sanity-check
+#   a branch); it uploads a build artifact instead of touching any release.
+#
+# This produces an UNSIGNED build (CODE_SIGNING_ALLOWED=NO) — CI has no access
+# to your Developer ID certificate. Anyone downloading the zip will need to
+# right-click → Open (or `xattr -cr`) past Gatekeeper the first time. To ship a
+# signed, notarized build instead, add your certificate (base64 .p12) and an
+# app-specific notarization password as repo secrets, import the cert in a
+# step before `xcodebuild`, and run `xcodebuild -exportArchive` +
+# `xcrun notarytool submit` — ask for that version if you want it wired up.
+
+on:
+  release:
+    types: [created]
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SCHEME: swift-mail
+  PROJECT: swift-mail.xcodeproj
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          # Bump this to a specific version (e.g. "16.4") if the runner's
+          # "latest-stable" doesn't yet ship the SDK this project targets
+          # (currently macOS 26.5 — see MACOSX_DEPLOYMENT_TARGET).
+          xcode-version: latest-stable
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -derivedDataPath build \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Zip app bundle
+        run: |
+          set -euo pipefail
+          cd build/Build/Products/Release
+          # ditto (not plain zip) preserves the bundle structure and extended
+          # attributes an .app relies on.
+          ditto -c -k --sequesterRsrc --keepParent "$SCHEME.app" "$GITHUB_WORKSPACE/$SCHEME-macos.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SCHEME }}-macos
+          path: ${{ env.SCHEME }}-macos.zip
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "$SCHEME-macos.zip" \
+            --clobber \
+            --repo "${{ github.repository }}"
+
+      - name: Create release for tag push
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" \
+            "$SCHEME-macos.zip" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --generate-notes

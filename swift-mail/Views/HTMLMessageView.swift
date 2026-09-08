@@ -2,7 +2,21 @@ import SwiftUI
 import WebKit
 
 struct HTMLMessageView: NSViewRepresentable {
+    /// How the web view's own page background interacts with the surrounding
+    /// window.
+    enum Chrome {
+        /// Shows the app's own window chrome through — used for the message
+        /// reader, where the incoming HTML is expected to declare its own
+        /// background.
+        case transparent
+        /// Renders on its own opaque white page regardless of the app's
+        /// appearance — used for compose's "As Recipient Sees It", which must
+        /// look identical to what ships, not to whatever theme the app is in.
+        case opaque
+    }
+
     let html: String
+    var chrome: Chrome = .transparent
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
@@ -11,19 +25,31 @@ struct HTMLMessageView: NSViewRepresentable {
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
-        webView.setValue(false, forKey: "drawsBackground")
         webView.allowsBackForwardNavigationGestures = false
+        applyChrome(to: webView)
 
         return webView
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
-        guard context.coordinator.loadedHTML != html else {
+        applyChrome(to: webView)
+
+        guard context.coordinator.loadedHTML != html || context.coordinator.loadedChrome != chrome else {
             return
         }
 
         context.coordinator.loadedHTML = html
-        webView.loadHTMLString(html.readerStyled(), baseURL: nil)
+        context.coordinator.loadedChrome = chrome
+        webView.loadHTMLString(html.readerStyled(transparent: chrome == .transparent), baseURL: nil)
+    }
+
+    /// `underPageBackgroundColor` (macOS 13+) is the supported way to make a
+    /// `WKWebView` see-through. Earlier code reached for the private
+    /// `drawsBackground` KVC key, which `WKWebView` doesn't declare publicly —
+    /// an SDK update could turn that into an `NSUnknownKeyException` crash the
+    /// moment any message is opened.
+    private func applyChrome(to webView: WKWebView) {
+        webView.underPageBackgroundColor = chrome == .transparent ? .clear : .white
     }
 
     func makeCoordinator() -> Coordinator {
@@ -32,6 +58,7 @@ struct HTMLMessageView: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         var loadedHTML: String?
+        var loadedChrome: Chrome?
 
         func webView(
             _ webView: WKWebView,
@@ -52,16 +79,18 @@ struct HTMLMessageView: NSViewRepresentable {
 }
 
 private extension String {
-    func readerStyled() -> String {
+    func readerStyled(transparent: Bool) -> String {
+        let backgroundRule = transparent
+            ? "html { background: transparent !important; }"
+            : "html { background: #ffffff !important; }"
+
         let style = """
         <style>
             :root {
-                color-scheme: light dark;
+                color-scheme: \(transparent ? "light dark" : "light");
             }
 
-            html {
-                background: transparent !important;
-            }
+            \(backgroundRule)
 
             body {
                 box-sizing: border-box !important;

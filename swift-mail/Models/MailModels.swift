@@ -29,10 +29,26 @@ nonisolated struct JMAPSession: Decodable {
         let typeList = types.joined(separator: ",")
         let absoluteString = eventSourceURL.absoluteString
 
-        if absoluteString.contains("{types}") || absoluteString.contains("{closeafter}") {
+        // RFC 8620 §7.3 defines `eventSourceUrl` as a URI template —
+        // `.../{types}/{closeafter}/{ping}` — which is the form every
+        // spec-compliant JMAP server actually sends. But `URL(string:)`
+        // percent-encodes `{`/`}` the moment this struct is decoded from the
+        // server's JSON, so by the time `absoluteString` is read here the
+        // placeholders are already `%7Btypes%7D` etc., not the literal braces
+        // — checking only the literal form would silently never match a real
+        // server's URL and fall through to appending query items below,
+        // which most servers don't recognize. `{ping}`, if present, is
+        // substituted with `0` (no keepalive ping), since this client
+        // doesn't need one.
+        let hasTemplate = absoluteString.contains("{types}") || absoluteString.contains("%7Btypes%7D")
+        if hasTemplate {
             let expanded = absoluteString
                 .replacingOccurrences(of: "{types}", with: typeList)
+                .replacingOccurrences(of: "%7Btypes%7D", with: typeList)
                 .replacingOccurrences(of: "{closeafter}", with: String(closeAfter))
+                .replacingOccurrences(of: "%7Bcloseafter%7D", with: String(closeAfter))
+                .replacingOccurrences(of: "{ping}", with: "0")
+                .replacingOccurrences(of: "%7Bping%7D", with: "0")
 
             return URL(string: expanded)
         }
@@ -117,12 +133,24 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
         keywords?["$seen"] != true
     }
 
+    var isFlagged: Bool {
+        keywords?["$flagged"] == true
+    }
+
     func settingSeen(_ isSeen: Bool) -> EmailPreview {
+        settingKeyword("$seen", isSeen)
+    }
+
+    func settingFlagged(_ isFlagged: Bool) -> EmailPreview {
+        settingKeyword("$flagged", isFlagged)
+    }
+
+    private func settingKeyword(_ keyword: String, _ isSet: Bool) -> EmailPreview {
         var keywords = keywords ?? [:]
-        if isSeen {
-            keywords["$seen"] = true
+        if isSet {
+            keywords[keyword] = true
         } else {
-            keywords.removeValue(forKey: "$seen")
+            keywords.removeValue(forKey: keyword)
         }
 
         return EmailPreview(
@@ -179,6 +207,10 @@ nonisolated struct EmailDetail: Identifiable, Hashable, Decodable {
         keywords?["$seen"] != true
     }
 
+    var isFlagged: Bool {
+        keywords?["$flagged"] == true
+    }
+
     var readableBody: String {
         if let text = firstBodyValue(from: textBody) {
             return text
@@ -223,11 +255,19 @@ nonisolated struct EmailDetail: Identifiable, Hashable, Decodable {
     }
 
     func settingSeen(_ isSeen: Bool) -> EmailDetail {
+        settingKeyword("$seen", isSeen)
+    }
+
+    func settingFlagged(_ isFlagged: Bool) -> EmailDetail {
+        settingKeyword("$flagged", isFlagged)
+    }
+
+    private func settingKeyword(_ keyword: String, _ isSet: Bool) -> EmailDetail {
         var keywords = keywords ?? [:]
-        if isSeen {
-            keywords["$seen"] = true
+        if isSet {
+            keywords[keyword] = true
         } else {
-            keywords.removeValue(forKey: "$seen")
+            keywords.removeValue(forKey: keyword)
         }
 
         return EmailDetail(
