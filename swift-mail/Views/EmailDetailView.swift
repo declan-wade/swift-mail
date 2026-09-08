@@ -156,9 +156,23 @@ private struct RemoteContentNotice: View {
             Image(systemName: "photo.badge.arrow.down")
                 .foregroundStyle(.secondary)
 
+            // `fixedSize(vertical:)` without a line limit is what used to
+            // wedge the whole window. Sharing a row with a `Spacer`, this text
+            // is offered a near-zero width when SwiftUI computes the reader's
+            // *minimum* height, and fixedSize then asks for however many lines
+            // that takes — about 1180pt, which AppKit installed as the
+            // window's `contentMinSize`. Taller than the screen, the window
+            // could no longer shrink to the visible frame: filling it ran the
+            // bottom under the Dock, dragging it out of a tiled state snapped
+            // it back to the top edge, and the over-tall content overflowed
+            // upward beneath the transparent titlebar, so the toolbar sat on
+            // top of the reader and the first message row. The line limit
+            // bounds that height while still letting the notice wrap, the same
+            // way the subject line above does.
             Text("Remote images in this message weren’t loaded to protect your privacy.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
 
             Spacer(minLength: Theme.Spacing.sm)

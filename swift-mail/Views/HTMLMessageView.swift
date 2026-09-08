@@ -35,6 +35,17 @@ struct HTMLMessageView: NSViewRepresentable {
         return webView
     }
 
+    /// A `WKWebView` scrolls its own content, so it must never report a height
+    /// back to SwiftUI. Left to the default representable sizing, it hands
+    /// SwiftUI its `fittingSize`, which feeds the reader's minimum height and
+    /// from there the window's `contentMinSize` — measured here as tens of
+    /// points of extra minimum height that grew with the window's width, so
+    /// the window got harder to shrink the wider it was. Accepting the
+    /// proposal outright makes the view purely elastic, like `Color`.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: WKWebView, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? 320, height: proposal.height ?? 240)
+    }
+
     func updateNSView(_ webView: WKWebView, context: Context) {
         applyChrome(to: webView)
 
