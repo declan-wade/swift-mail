@@ -723,16 +723,24 @@ final class MailStore: ObservableObject {
                     await applyStateChange(change)
                 }
 
-                // A clean end is the server's `closeafter` — reconnect at once
-                // and reconcile anything missed while off the wire.
                 try Task.checkCancellation()
-                await syncNow()
             } catch is CancellationError {
                 return
             } catch {
                 try? await Task.sleep(for: backoff)
                 backoff = min(backoff * 2, .seconds(120))
             }
+
+            // Reconcile on every disconnect, clean or failed. State changes are
+            // edge-triggered, so anything that happened while off the wire is
+            // only ever seen by asking. Reconciling here also means a server
+            // that refuses the stream outright degrades into polling at the
+            // backoff interval instead of going quiet.
+            guard !Task.isCancelled else {
+                return
+            }
+
+            await syncNow()
         }
     }
 

@@ -62,7 +62,12 @@ nonisolated struct JMAPSession: Decodable {
         primaryAccounts["urn:ietf:params:jmap:submission"] ?? mailAccountID
     }
 
-    func eventSourceURL(types: [String], closeAfter: Int = 300) -> URL? {
+    /// RFC 8620 7.3: `closeafter` takes `"state"` or `"no"` — never a number —
+    /// and `ping` is a seconds interval, where `0` disables the keepalive
+    /// entirely. A persistent connection with a 300s ping is the mode the RFC
+    /// describes as usual; the ping doubles as the liveness signal that lets a
+    /// silently dropped connection hit the request timeout and reconnect.
+    func eventSourceURL(types: [String], closeAfter: String = "no", ping: Int = 300) -> URL? {
         guard let eventSourceURL else {
             return nil
         }
@@ -78,18 +83,16 @@ nonisolated struct JMAPSession: Decodable {
         // placeholders are already `%7Btypes%7D` etc., not the literal braces
         // — checking only the literal form would silently never match a real
         // server's URL and fall through to appending query items below,
-        // which most servers don't recognize. `{ping}`, if present, is
-        // substituted with `0` (no keepalive ping), since this client
-        // doesn't need one.
+        // which most servers don't recognize.
         let hasTemplate = absoluteString.contains("{types}") || absoluteString.contains("%7Btypes%7D")
         if hasTemplate {
             let expanded = absoluteString
                 .replacingOccurrences(of: "{types}", with: typeList)
                 .replacingOccurrences(of: "%7Btypes%7D", with: typeList)
-                .replacingOccurrences(of: "{closeafter}", with: String(closeAfter))
-                .replacingOccurrences(of: "%7Bcloseafter%7D", with: String(closeAfter))
-                .replacingOccurrences(of: "{ping}", with: "0")
-                .replacingOccurrences(of: "%7Bping%7D", with: "0")
+                .replacingOccurrences(of: "{closeafter}", with: closeAfter)
+                .replacingOccurrences(of: "%7Bcloseafter%7D", with: closeAfter)
+                .replacingOccurrences(of: "{ping}", with: String(ping))
+                .replacingOccurrences(of: "%7Bping%7D", with: String(ping))
 
             return URL(string: expanded)
         }
@@ -103,7 +106,10 @@ nonisolated struct JMAPSession: Decodable {
             queryItems.append(URLQueryItem(name: "types", value: typeList))
         }
         if !queryItems.contains(where: { $0.name == "closeafter" }) {
-            queryItems.append(URLQueryItem(name: "closeafter", value: String(closeAfter)))
+            queryItems.append(URLQueryItem(name: "closeafter", value: closeAfter))
+        }
+        if !queryItems.contains(where: { $0.name == "ping" }) {
+            queryItems.append(URLQueryItem(name: "ping", value: String(ping)))
         }
         components.queryItems = queryItems
 

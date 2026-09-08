@@ -14,10 +14,9 @@ nonisolated struct JMAPStateChange: Decodable {
 
 /// Streams JMAP `StateChange` objects from the account's `eventSourceUrl`.
 ///
-/// The server closes the connection after `closeafter` seconds (see
-/// `JMAPSession.eventSourceURL(types:closeAfter:)`); the stream simply finishes
-/// then and the caller reconnects. Transport errors are surfaced so the caller
-/// can back off.
+/// The stream finishes when the server closes the connection; the caller
+/// reconnects and reconciles. Transport errors are surfaced so the caller can
+/// back off.
 struct JMAPEventSource {
     let url: URL
     let bearerToken: String
@@ -38,31 +37,33 @@ struct JMAPEventSource {
                         throw JMAPError.invalidEventSourceResponse
                     }
 
-                    var eventName = ""
-                    var dataLines: [String] = []
+                    var parser = ServerSentEventParser()
+                    var line: [UInt8] = []
 
-                    for try await line in bytes.lines {
+                    // Framed byte by byte rather than with `bytes.lines`:
+                    // Foundation's `AsyncLineSequence` silently drops empty
+                    // lines, and an empty line is precisely what terminates an
+                    // SSE frame. Consuming it that way never sees a frame
+                    // boundary, so every event on a connection accumulates into
+                    // one buffer and is only "delivered" — as unparseable
+                    // concatenated JSON — once the connection closes.
+                    for try await byte in bytes {
                         try Task.checkCancellation()
 
-                        if line.isEmpty {
-                            emit(eventName: eventName, dataLines: dataLines, continuation: continuation)
-                            eventName = ""
-                            dataLines = []
+                        guard byte == UInt8(ascii: "\n") else {
+                            line.append(byte)
                             continue
                         }
 
-                        if line.hasPrefix(":") {
-                            continue
-                        }
-
-                        if line.hasPrefix("event:") {
-                            eventName = line.droppingServerSentEventPrefix("event:")
-                        } else if line.hasPrefix("data:") {
-                            dataLines.append(line.droppingServerSentEventPrefix("data:"))
+                        if let frame = parser.consume(line: Self.take(&line)) {
+                            emit(frame, continuation: continuation)
                         }
                     }
 
-                    emit(eventName: eventName, dataLines: dataLines, continuation: continuation)
+                    if !line.isEmpty, let frame = parser.consume(line: Self.take(&line)) {
+                        emit(frame, continuation: continuation)
+                    }
+
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish()
@@ -77,22 +78,70 @@ struct JMAPEventSource {
         }
     }
 
+    /// Consumes the buffered bytes as one line, dropping the CR of a CRLF.
+    private static func take(_ line: inout [UInt8]) -> String {
+        if line.last == UInt8(ascii: "\r") {
+            line.removeLast()
+        }
+
+        defer { line.removeAll(keepingCapacity: true) }
+
+        return String(decoding: line, as: UTF8.self)
+    }
+
     private func emit(
-        eventName: String,
-        dataLines: [String],
+        _ frame: ServerSentEventParser.Frame,
         continuation: AsyncThrowingStream<JMAPStateChange, Error>.Continuation
     ) {
-        guard eventName != "ping", !dataLines.isEmpty else {
+        // `ping` is the RFC 8620 7.3 keepalive; it carries an interval, not a
+        // state, and only needs to have kept the connection warm.
+        guard frame.event != "ping" else {
             return
         }
 
-        let payload = dataLines.joined(separator: "\n")
-        guard let data = payload.data(using: .utf8),
+        guard let data = frame.data.data(using: .utf8),
               let change = try? JSONDecoder().decode(JMAPStateChange.self, from: data) else {
             return
         }
 
         continuation.yield(change)
+    }
+}
+
+/// Reassembles server-sent-event frames from lines, per the SSE grammar: fields
+/// accumulate until a blank line completes the frame.
+nonisolated struct ServerSentEventParser {
+    struct Frame: Equatable {
+        let event: String
+        let data: String
+    }
+
+    private var event = ""
+    private var dataLines: [String] = []
+
+    /// Feeds one line. Returns a frame when the blank delimiter completes one.
+    mutating func consume(line: String) -> Frame? {
+        guard !line.isEmpty else {
+            defer {
+                event = ""
+                dataLines = []
+            }
+
+            return dataLines.isEmpty ? nil : Frame(event: event, data: dataLines.joined(separator: "\n"))
+        }
+
+        // A leading colon is a comment, which some servers use as a keepalive.
+        guard !line.hasPrefix(":") else {
+            return nil
+        }
+
+        if line.hasPrefix("event:") {
+            event = line.droppingServerSentEventPrefix("event:")
+        } else if line.hasPrefix("data:") {
+            dataLines.append(line.droppingServerSentEventPrefix("data:"))
+        }
+
+        return nil
     }
 }
 
@@ -110,7 +159,7 @@ private extension URLSession {
     }()
 }
 
-private extension String {
+fileprivate extension String {
     func droppingServerSentEventPrefix(_ prefix: String) -> String {
         var value = String(dropFirst(prefix.count))
         if value.hasPrefix(" ") {

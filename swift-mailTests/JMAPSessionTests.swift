@@ -62,29 +62,31 @@ struct JMAPSessionTests {
         // form to test against; the literal-brace form used to be the only
         // one checked and is unreachable through the real decode path.
         let session = makeSession(eventSourceURL: URL(string: "https://example.com/events/{types}/{closeafter}"))
-        let url = session.eventSourceURL(types: ["Email", "Mailbox"], closeAfter: 60)
+        let url = session.eventSourceURL(types: ["Email", "Mailbox"], closeAfter: "state")
 
-        #expect(url?.absoluteString == "https://example.com/events/Email,Mailbox/60")
+        #expect(url?.absoluteString == "https://example.com/events/Email,Mailbox/state")
     }
 
     @Test("An RFC 8620 template with a ping placeholder still resolves")
     func templateWithPingPlaceholder() {
         let session = makeSession(eventSourceURL: URL(string: "https://example.com/events/{types}/{closeafter}/{ping}"))
-        let url = session.eventSourceURL(types: ["Email"], closeAfter: 300)
+        let url = session.eventSourceURL(types: ["Email"])
 
-        #expect(url?.absoluteString == "https://example.com/events/Email/300/0")
+        // RFC 8620 7.3: `closeafter` is "state"/"no", `ping` a seconds interval.
+        #expect(url?.absoluteString == "https://example.com/events/Email/no/300")
     }
 
     @Test("A plain event source URL gets query items appended instead")
     func plainURLGetsQueryItemsAppended() {
         let session = makeSession(eventSourceURL: URL(string: "https://example.com/events"))
-        let url = session.eventSourceURL(types: ["Email"], closeAfter: 300)
+        let url = session.eventSourceURL(types: ["Email"])
 
         let components = URLComponents(url: url!, resolvingAgainstBaseURL: false)
         let queryItems = components?.queryItems ?? []
 
         #expect(queryItems.contains(URLQueryItem(name: "types", value: "Email")))
-        #expect(queryItems.contains(URLQueryItem(name: "closeafter", value: "300")))
+        #expect(queryItems.contains(URLQueryItem(name: "closeafter", value: "no")))
+        #expect(queryItems.contains(URLQueryItem(name: "ping", value: "300")))
     }
 
     @Test("No event source URL means no event source")
