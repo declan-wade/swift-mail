@@ -374,14 +374,14 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Codable {
     }
 }
 
-nonisolated struct EmailBodyPart: Hashable, Decodable {
+nonisolated struct EmailBodyPart: Hashable, Codable {
     let partId: String?
     let type: String?
     let name: String?
 }
 
 /// A file attached to a message, as returned in `Email.attachments` (RFC 8621 §4.1.4).
-nonisolated struct EmailAttachment: Hashable, Decodable, Identifiable {
+nonisolated struct EmailAttachment: Hashable, Codable, Identifiable {
     let blobId: String?
     let type: String?
     let name: String?
@@ -418,7 +418,7 @@ nonisolated struct EmailAttachment: Hashable, Decodable, Identifiable {
     }
 }
 
-nonisolated struct EmailDetail: Identifiable, Hashable, Decodable {
+nonisolated struct EmailDetail: Identifiable, Hashable, Codable {
     let id: String
     let from: [EmailAddress]?
     let to: [EmailAddress]?
@@ -609,7 +609,7 @@ nonisolated struct EmailDetail: Identifiable, Hashable, Decodable {
     }
 }
 
-nonisolated struct EmailBodyValue: Hashable, Decodable {
+nonisolated struct EmailBodyValue: Hashable, Codable {
     let value: String
     let isEncodingProblem: Bool?
     let isTruncated: Bool?

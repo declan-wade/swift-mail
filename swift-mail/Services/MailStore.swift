@@ -138,9 +138,7 @@ final class MailStore: ObservableObject {
     /// server only for what changed (`Email/changes`) instead of re-querying.
     private var emailState: String?
     private var mailboxState: String?
-    /// The last unfiltered page of each folder visited, mirrored from the
-    /// snapshot so switching back to a folder renders before its query returns.
-    private var cachedPreviews: [Mailbox.ID: [EmailPreview]] = [:]
+    private let cache = MailCache.shared
     private var hasWiredNotificationHandler = false
     private let notificationService = NotificationService.shared
 
@@ -348,7 +346,7 @@ final class MailStore: ObservableObject {
         let restored = TagPreferences.loadActiveID()
         activeTagID = tags.contains { $0.id == restored } ? restored : nil
 
-        restoreSnapshot()
+        restoreFromCache()
     }
 
     /// Identifies the snapshot's owner. The JMAP account id would be better but
@@ -361,74 +359,63 @@ final class MailStore: ObservableObject {
     /// Fills the first frame from the last session's mail. Everything restored
     /// here is replaced by the first successful sync, so this only ever changes
     /// how quickly the window has something in it — never what it settles on.
-    private func restoreSnapshot() {
-        guard let account, let snapshot = MailSnapshotStore.load(accountKey: Self.accountKey(for: account)) else {
+    private func restoreFromCache() {
+        guard let account else {
             return
         }
 
-        mailboxes = snapshot.mailboxes
-        identities = snapshot.identities
-        cachedPreviews = snapshot.previews
-        selectedMailboxID = snapshot.selectedMailboxID
+        cache.open(accountKey: Self.accountKey(for: account))
 
-        // The cursors are the point of the file: restoring them is what lets
-        // the first sync of this launch ask for a delta rather than re-querying
-        // the whole mailbox.
-        emailState = snapshot.emailState
-        mailboxState = snapshot.mailboxState
+        mailboxes = cache.mailboxes()
+        identities = cache.identities()
+        selectedMailboxID = cache.selectedMailboxID()
 
-        guard let selectedMailboxID, let previews = snapshot.previews[selectedMailboxID] else {
+        // The cursors are the point of the whole cache: restoring them is what
+        // lets the first sync of this launch ask for a delta rather than
+        // re-querying the mailbox from scratch.
+        emailState = cache.syncState(for: "Email")
+        mailboxState = cache.syncState(for: "Mailbox")
+
+        guard let selectedMailboxID else {
             return
         }
 
-        emails = previews
-        selectedEmailID = previews.first?.id
+        let page = cache.page(mailboxID: selectedMailboxID, limit: emailPageSize)
+        guard !page.isEmpty else {
+            return
+        }
+
+        emails = page
+        selectedEmailID = page.first?.id
         // `loadedMailboxID` has to agree, or the reload `refresh()` starts a
         // moment later reads as a folder switch and clears these rows straight
         // back to a skeleton.
         loadedMailboxID = selectedMailboxID
     }
 
-    /// Writes the current state for the next launch. Called after anything that
-    /// advances a cursor or replaces a page; the encode and the write happen off
-    /// the main actor, and a dropped write only costs a slower launch.
-    private func saveSnapshot() {
-        guard let account else {
+    /// Mirrors what is on screen into the cache. Only the plain folder listing
+    /// is stored: a search or tag page would come back next launch looking like
+    /// the whole folder.
+    private func cacheVisibleList() {
+        cache.setSyncState(emailState, for: "Email")
+        cache.setSyncState(mailboxState, for: "Mailbox")
+        cache.setSelectedMailboxID(selectedMailboxID)
+
+        guard activeSearch == nil, activeTag == nil else {
             return
         }
 
-        var previews = cachedPreviews
-
-        // Only the plain folder listing is worth keeping. A search or tag page
-        // would come back next launch looking like the whole folder.
-        if let selectedMailboxID, activeSearch == nil, activeTag == nil {
-            previews[selectedMailboxID] = Array(emails.prefix(emailPageSize))
-            cachedPreviews = previews
-        }
-
-        let snapshot = MailSnapshot(
-            accountKey: Self.accountKey(for: account),
-            emailState: emailState,
-            mailboxState: mailboxState,
-            mailboxes: mailboxes,
-            identities: identities,
-            selectedMailboxID: selectedMailboxID,
-            previews: previews
-        )
-
-        Task.detached(priority: .utility) {
-            MailSnapshotStore.save(snapshot)
-        }
+        cache.store(previews: emails)
     }
 
-    /// The cached page is the unfiltered folder listing, so it is only a safe
-    /// thing to show while nothing is narrowing the list.
+    /// The cached page is the unfiltered folder listing, so it is only safe to
+    /// show while nothing is narrowing the list.
     private func cachedPage(for mailboxID: Mailbox.ID) -> [EmailPreview] {
         guard activeSearch == nil, activeTag == nil else {
             return []
         }
 
-        return cachedPreviews[mailboxID] ?? []
+        return cache.page(mailboxID: mailboxID, limit: emailPageSize)
     }
 
     func saveAccount(displayName: String, sessionURL: URL, bearerToken: String) throws {
@@ -437,8 +424,7 @@ final class MailStore: ObservableObject {
 
         UserDefaults.standard.set(data, forKey: accountStorageKey)
         try KeychainStore.saveToken(bearerToken)
-        MailSnapshotStore.clear()
-        cachedPreviews = [:]
+        cache.clear()
 
         self.account = account
         self.bearerToken = bearerToken
@@ -461,8 +447,7 @@ final class MailStore: ObservableObject {
         UserDefaults.standard.removeObject(forKey: accountStorageKey)
         try? KeychainStore.deleteToken()
         // Signing out has to take the cached mail with it.
-        MailSnapshotStore.clear()
-        cachedPreviews = [:]
+        cache.clear()
 
         account = nil
         bearerToken = nil
@@ -506,7 +491,8 @@ final class MailStore: ObservableObject {
             await seedSyncStates()
             startAutoFetchIfNeeded(session: session)
             await loadIdentities()
-            saveSnapshot()
+            cache.setMailboxes(mailboxes)
+            cache.setIdentities(identities)
 
             if let selectedMailboxID {
                 await loadEmails(mailboxID: selectedMailboxID)
@@ -566,7 +552,7 @@ final class MailStore: ObservableObject {
             applyPageMetadata(page)
             loadedMailboxID = mailboxID
             selectedEmailID = emails.first?.id
-            saveSnapshot()
+            cacheVisibleList()
 
             // The list has what it needs now; the reader's fetch is a separate
             // wait and shouldn't hold the message list behind the skeleton.
@@ -686,13 +672,30 @@ final class MailStore: ObservableObject {
         loadConversation(for: emailID)
 
         selectedEmailID = emailID
-        isLoadingSelectedEmail = true
         detailErrorMessage = nil
 
+        // A message body is immutable, so a cached one is not "stale data shown
+        // while we check" — it is the answer. The fetch behind it is only for
+        // the parts that aren't in the cache yet.
+        let cached = cache.body(for: emailID)
+        selectedEmail = cached
+        isLoadingSelectedEmail = cached == nil
+
         do {
-            selectedEmail = try await client.fetchEmailDetail(session: session, accountID: accountID, emailID: emailID)
+            let detail = try await client.fetchEmailDetail(session: session, accountID: accountID, emailID: emailID)
+            cache.store(body: detail)
+
+            // The reader may have moved on while this was in flight; writing the
+            // cache is still worth it, but the screen isn't ours to change.
+            if selectedEmailID == emailID {
+                selectedEmail = detail
+            }
         } catch {
-            detailErrorMessage = error.localizedDescription
+            // A cached body already on screen is a better answer than an error
+            // banner over the top of it.
+            if cached == nil {
+                detailErrorMessage = error.localizedDescription
+            }
         }
 
         isLoadingSelectedEmail = false
@@ -1200,13 +1203,27 @@ final class MailStore: ObservableObject {
     }
 
     private func attachmentData(_ attachment: EmailAttachment) async throws -> Data {
-        let context = try await apiContext()
+        if let blobID = attachment.blobId, let cached = cache.blob(for: blobID) {
+            return cached
+        }
 
-        return try await context.client.downloadBlob(
+        let context = try await apiContext()
+        let data = try await context.client.downloadBlob(
             session: context.session,
             accountID: context.accountID,
             attachment: attachment
         )
+
+        if let blobID = attachment.blobId {
+            // Attachments are the one write here big enough to be worth keeping
+            // off the main actor.
+            let cache = cache
+            Task.detached(priority: .utility) {
+                cache.store(blob: data, for: blobID)
+            }
+        }
+
+        return data
     }
 
     /// The sender picks the attachment name, so it is reduced to a single, plain
@@ -1419,7 +1436,8 @@ final class MailStore: ObservableObject {
             mailboxState = newState
             NotifyingMailboxes.seedIfNeeded(inboxID: mailboxes.first { $0.role == "inbox" }?.id)
             updateDockBadge()
-            saveSnapshot()
+            cache.setMailboxes(mailboxes)
+            cache.setSyncState(mailboxState, for: "Mailbox")
         } catch {
             backgroundErrorMessage = error.localizedDescription
         }
@@ -1474,9 +1492,11 @@ final class MailStore: ObservableObject {
 
             emailState = cursor
             applyEmailDeltas(previews: previews, createdIDs: createdSet, destroyedIDs: destroyedSet)
+            cache.remove(emailIDs: destroyedSet)
+            cache.store(previews: previews)
             // Without this the on-disk cursor goes stale while the app stays
             // open, and a long-running session still relaunches into a big diff.
-            saveSnapshot()
+            cacheVisibleList()
         } catch {
             emailState = newState
             await reloadVisibleList()
