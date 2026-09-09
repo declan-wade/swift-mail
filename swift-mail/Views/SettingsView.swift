@@ -9,7 +9,7 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             Tab("General", systemImage: "gearshape") {
-                GeneralSettings()
+                GeneralSettings(store: store)
             }
 
             Tab("Tags", systemImage: "tag") {
@@ -44,6 +44,8 @@ private extension View {
 
 /// How a message behaves when you read it or swipe it.
 private struct GeneralSettings: View {
+    @ObservedObject var store: MailStore
+    @AppStorage(SendPreferences.undoDelayKey) private var undoDelay = 0
     @AppStorage(ReadingPreferences.marksReadOnOpenKey) private var marksReadOnOpen = false
     @AppStorage(SwipePreferences.leadingKey) private var leadingSwipe = SwipePreferences.leadingDefault.rawValue
     @AppStorage(SwipePreferences.trailingKey) private var trailingSwipe = SwipePreferences.trailingDefault.rawValue
@@ -56,6 +58,23 @@ private struct GeneralSettings: View {
                     Text("When I open the message").tag(true)
                 }
                 .pickerStyle(.radioGroup)
+            }
+
+            Section {
+                Picker("Delay sending by", selection: $undoDelay) {
+                    ForEach(SendPreferences.undoDelayChoices, id: \.self) { seconds in
+                        Text(seconds == 0 ? "Don't delay" : "\(seconds) seconds").tag(seconds)
+                    }
+                }
+                .disabled(!store.supportsDelayedSend)
+            } header: {
+                Text("Sending")
+            } footer: {
+                Text(store.supportsDelayedSend
+                     ? "The server holds the message for this long before releasing it, and it can be recalled until then. The hold is the server's, so it survives quitting the app."
+                     : "This account's server won't hold outgoing mail, so messages send immediately and can't be recalled.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {
@@ -74,7 +93,7 @@ private struct GeneralSettings: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .settingsPane(height: 330)
+        .settingsPane(height: 430)
     }
 
     @ViewBuilder
@@ -119,15 +138,12 @@ private struct TagSettings: View {
             }
 
             Section {
-                if store.identities.isEmpty {
-                    Text("Connect an account to see your aliases.")
-                        .foregroundStyle(.secondary)
-                } else if store.tags.isEmpty {
-                    Text("Add a tag first, then assign your aliases to it.")
+                if store.tags.isEmpty {
+                    Text("Add a tag first, then assign your addresses to it.")
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(store.identities) { identity in
-                        Picker(identity.email, selection: tagBinding(for: identity)) {
+                    ForEach(store.taggableAddresses, id: \.self) { address in
+                        Picker(address, selection: tagBinding(for: address)) {
                             Text("None").tag(MailTag.ID?.none)
 
                             ForEach(store.tags) { tag in
@@ -135,23 +151,76 @@ private struct TagSettings: View {
                             }
                         }
                     }
+
+                    AddAddressRow(tags: store.tags) { address, tagID in
+                        store.assignAddress(address, toTagID: tagID)
+                    }
                 }
             } header: {
-                Text("Aliases")
+                Text("Addresses")
             } footer: {
-                Text("A message takes the tag of the address it was sent to, or sent from — so Sent and Drafts sort the same way the Inbox does. A wildcard alias like *@example.com covers every address on that domain.")
+                Text("A message takes the tag of the address it was sent to, or sent from — so Sent and Drafts sort the same way the Inbox does. Your sending identities are listed automatically; type anything else your mail arrives at, including an external Outlook, Gmail or SMTP account. A wildcard like *@example.com covers every address on that domain. Set an address to None to drop it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
-        .settingsPane(height: 520)
+        .settingsPane(height: 560)
     }
 
-    private func tagBinding(for identity: MailIdentity) -> Binding<MailTag.ID?> {
+    private func tagBinding(for address: String) -> Binding<MailTag.ID?> {
         Binding(
-            get: { store.tags.first { $0.contains(address: identity.email) }?.id },
-            set: { store.assignAddress(identity.email, toTagID: $0) }
+            get: { store.tags.first { $0.contains(address: address) }?.id },
+            set: { store.assignAddress(address, toTagID: $0) }
         )
+    }
+}
+
+/// Adds an address the account doesn't advertise as a sending identity.
+///
+/// The tag is chosen here rather than after the fact because an address that
+/// belongs to no tag has nowhere to be stored — the assignment *is* the record
+/// of the address.
+private struct AddAddressRow: View {
+    let tags: [MailTag]
+    let onAdd: (String, MailTag.ID) -> Void
+
+    @State private var text = ""
+    @State private var tagID: MailTag.ID?
+
+    private var normalized: String? {
+        MailTag.normalizedAddress(text)
+    }
+
+    private var selectedTagID: MailTag.ID? {
+        tagID ?? tags.first?.id
+    }
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            TextField("name@example.com", text: $text)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(add)
+
+            Picker("Tag", selection: Binding(get: { selectedTagID }, set: { tagID = $0 })) {
+                ForEach(tags) { tag in
+                    Text(tag.displayName).tag(MailTag.ID?.some(tag.id))
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+
+            Button("Add", action: add)
+                .disabled(normalized == nil || selectedTagID == nil)
+        }
+    }
+
+    private func add() {
+        guard let normalized, let selectedTagID else {
+            return
+        }
+
+        onAdd(normalized, selectedTagID)
+        text = ""
     }
 }
 
@@ -280,6 +349,12 @@ private struct AdvancedSettings: View {
 
             Section("Features") {
                 LabeledContent("Snooze", value: store.supportsSnooze ? "Available" : "Not available")
+                LabeledContent(
+                    "Delayed send",
+                    value: store.supportsDelayedSend
+                        ? "Up to \(Duration.seconds(store.maxDelayedSend).formatted(.units(allowed: [.days, .hours, .minutes], width: .wide)))"
+                        : "Not available"
+                )
             }
         }
         // Diagnostics run long; the tail scrolls rather than making the

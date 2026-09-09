@@ -45,6 +45,160 @@ nonisolated enum ReadingPreferences {
     }
 }
 
+/// How long the server holds a message before releasing it.
+///
+/// Send later and undo send are the same mechanism — an `EmailSubmission` with
+/// a `sendAt` in the future, cancellable until then — so they share one
+/// setting and one code path. Nothing is held locally: the hold is the
+/// server's, which is why it survives quitting the app.
+nonisolated enum SendPreferences {
+    /// Seconds. `0` (the default, and what `UserDefaults` returns for an unset
+    /// key) means send immediately, matching what the app did before this
+    /// existed.
+    static let undoDelayKey = "swift-mail.undoSendDelay"
+
+    static let undoDelayChoices = [0, 5, 10, 30]
+
+    static var undoDelay: Int {
+        UserDefaults.standard.integer(forKey: undoDelayKey)
+    }
+
+    /// The `sendAt` to ask for, or nil to send immediately.
+    ///
+    /// An explicit request wins over the undo delay — scheduling for Monday
+    /// shouldn't also wait ten seconds — and both are clamped to what the
+    /// server said it would hold, since asking for longer is rejected outright
+    /// rather than shortened.
+    static func releaseDate(
+        requested: Date?,
+        undoDelay: Int,
+        maxDelayedSend: Int,
+        now: Date = Date()
+    ) -> Date? {
+        guard maxDelayedSend > 0 else {
+            return nil
+        }
+
+        let wanted = requested ?? (undoDelay > 0 ? now.addingTimeInterval(TimeInterval(undoDelay)) : nil)
+
+        // A date already in the past is a schedule the user let lapse; send now
+        // rather than have the server refuse it.
+        guard let wanted, wanted > now else {
+            return nil
+        }
+
+        return min(wanted, now.addingTimeInterval(TimeInterval(maxDelayedSend)))
+    }
+}
+
+/// The times a message can be scheduled for without opening a date picker.
+///
+/// Every case resolves against a real calendar rather than an offset in hours,
+/// so "tomorrow morning" lands at 8am tomorrow whatever time it is now, and
+/// stays right across a daylight-saving change.
+nonisolated enum SendLaterPreset: String, CaseIterable, Identifiable {
+    case thisEvening
+    case tomorrowMorning
+    case mondayMorning
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .thisEvening: "This Evening"
+        case .tomorrowMorning: "Tomorrow Morning"
+        case .mondayMorning: "Monday Morning"
+        }
+    }
+
+    /// `nil` when the moment has already passed today — an evening send offered
+    /// at 11pm would otherwise mean "eighteen hours ago".
+    func date(from now: Date, calendar: Calendar = .current) -> Date? {
+        switch self {
+        case .thisEvening:
+            return calendar.date(bySettingHour: 18, minute: 0, second: 0, of: now).flatMap { $0 > now ? $0 : nil }
+        case .tomorrowMorning:
+            guard let tomorrow = calendar.date(byAdding: .day, value: 1, to: now) else {
+                return nil
+            }
+
+            return calendar.date(bySettingHour: 8, minute: 0, second: 0, of: tomorrow)
+        case .mondayMorning:
+            // `nextDate` skips today, so a Monday-morning send made on Monday
+            // means next Monday rather than a time that may already be gone.
+            return calendar.nextDate(
+                after: now,
+                matching: DateComponents(hour: 8, minute: 0, second: 0, weekday: 2),
+                matchingPolicy: .nextTime
+            )
+        }
+    }
+
+    /// The presets this server will actually accept, in order. A cap of a few
+    /// hours quietly leaves only the near ones rather than offering a Monday
+    /// the send would be rejected for.
+    static func available(from now: Date, within maxDelayedSend: Int, calendar: Calendar = .current) -> [(preset: SendLaterPreset, date: Date)] {
+        let latest = now.addingTimeInterval(TimeInterval(maxDelayedSend))
+
+        return allCases.compactMap { preset in
+            guard let date = preset.date(from: now, calendar: calendar), date <= latest else {
+                return nil
+            }
+
+            return (preset, date)
+        }
+    }
+}
+
+/// A message the server is still holding, and how long the app will keep
+/// offering to call it back.
+nonisolated struct PendingSend: Equatable {
+    let submissionID: String
+    let subject: String
+    /// The mailbox the send filed it into — Scheduled where the account has
+    /// one. Undo needs it to know what to take the message back out of.
+    let fileInMailboxID: String?
+    /// When the server releases it.
+    let sendAt: Date
+    /// When the undo banner gives up. Equal to `sendAt` for an undo-window
+    /// send; capped for a schedule further out, where a banner is the wrong
+    /// place to keep the offer alive.
+    let undoUntil: Date
+
+    /// A banner is a transient thing. Past this, cancelling a scheduled message
+    /// wants a list of what is queued.
+    // ponytail: no scheduled-messages list; `EmailSubmission/query` filtered on
+    // undoStatus "pending" is the upgrade path when one is wanted.
+    static let maxBannerWindow: TimeInterval = 30
+
+    /// When this message goes, phrased for the reader: seconds while the hold
+    /// is short enough to count down, a date once counting down reads as
+    /// absurd. Shared so the banner and the quit warning can't drift apart.
+    func releaseDescription(at now: Date = Date()) -> String {
+        let seconds = Int(sendAt.timeIntervalSince(now).rounded())
+
+        guard seconds > 60 else {
+            return "in \(max(0, seconds)) seconds"
+        }
+
+        return "on \(sendAt.formatted(date: .abbreviated, time: .shortened))"
+    }
+
+    init(
+        submissionID: String,
+        subject: String,
+        fileInMailboxID: String?,
+        sendAt: Date,
+        now: Date = Date()
+    ) {
+        self.submissionID = submissionID
+        self.subject = subject
+        self.fileInMailboxID = fileInMailboxID
+        self.sendAt = sendAt
+        self.undoUntil = min(sendAt, now.addingTimeInterval(Self.maxBannerWindow))
+    }
+}
+
 @MainActor
 final class MailStore: ObservableObject {
     @Published var account: MailAccount?
@@ -121,6 +275,10 @@ final class MailStore: ObservableObject {
     /// Changes made here that the server hasn't accepted yet. Non-zero means
     /// the app is holding work for a connection it doesn't have.
     @Published private(set) var pendingOutboxCount = 0
+
+    /// The send currently offered for undo, if any.
+    @Published private(set) var pendingSend: PendingSend?
+    private var undoWindowTask: Task<Void, Never>?
 
     @Published private var session: JMAPSession?
     private var accountID: String?
@@ -253,6 +411,16 @@ final class MailStore: ObservableObject {
         ].compactMap { label, value in value.map { (label, $0) } }
     }
 
+    /// Seconds this account may hold a submission for. `0` means the server
+    /// won't hold anything, so neither send later nor undo send is offered.
+    var maxDelayedSend: Int {
+        session?.maxDelayedSend(accountID: session?.submissionAccountID ?? accountID) ?? 0
+    }
+
+    var supportsDelayedSend: Bool {
+        maxDelayedSend > 0
+    }
+
     var supportsSnooze: Bool {
         session?.supports(JMAPCapability.snoozeURN, accountID: accountID) ?? false
     }
@@ -305,6 +473,19 @@ final class MailStore: ObservableObject {
 
     /// Adds a tag already named and coloured, so the common case is one click
     /// and no decisions.
+    /// Every address the Tags pane offers.
+    ///
+    /// Sending identities are the convenient starting point, not the boundary:
+    /// anything already assigned to a tag stays listed, which is what keeps a
+    /// hand-typed address — an external Outlook or Gmail account, an alias this
+    /// account only receives at — visible once it has been added.
+    var taggableAddresses: [String] {
+        let assigned = tags.flatMap(\.addresses)
+        let known = identities.map(\.email) + assigned
+
+        return Array(Set(known.map { $0.lowercased() })).sorted()
+    }
+
     func addTag() {
         tags.append(
             MailTag(
@@ -1279,21 +1460,35 @@ final class MailStore: ObservableObject {
         emails.removeAll { $0.id == sourceDraftID }
     }
 
-    func send(_ draft: ComposeDraft) async throws {
+    /// - Parameter sendAt: an explicit time to release the message. Left nil,
+    ///   the undo-send delay decides — so an ordinary send is still held long
+    ///   enough to be called back when that preference is on.
+    func send(_ draft: ComposeDraft, sendAt: Date? = nil) async throws {
         let context = try await apiContext()
 
         guard let draftsMailboxID = mailbox(role: "drafts")?.id else {
             throw JMAPError.missingMailbox("Drafts")
         }
 
-        try await context.client.send(
+        let releaseAt = SendPreferences.releaseDate(
+            requested: sendAt,
+            undoDelay: SendPreferences.undoDelay,
+            maxDelayedSend: maxDelayedSend
+        )
+
+        // Only a time the user actually asked for counts as scheduling; the
+        // automatic undo hold does not, and files to Sent as it always has.
+        let fileInMailboxID = filingMailboxID(isScheduled: sendAt != nil && releaseAt != nil)
+
+        let submissionID = try await context.client.send(
             session: context.session,
             accountID: context.accountID,
             submissionAccountID: context.session.submissionAccountID ?? context.accountID,
             draft: draft,
             identity: try requireIdentity(for: draft),
             draftsMailboxID: draftsMailboxID,
-            sentMailboxID: mailbox(role: "sent")?.id
+            fileInMailboxID: fileInMailboxID,
+            sendAt: releaseAt
         )
 
         await discardResumedDraft(draft, context: context)
@@ -1302,7 +1497,108 @@ final class MailStore: ObservableObject {
             await loadEmailDetail(emailID: originalEmailID)
         }
 
-        await refreshIfViewing(mailboxRole: "sent")
+        await refreshIfViewing(mailboxID: fileInMailboxID)
+
+        // The message id isn't carried: `onSuccessUpdateEmail` resolves it from
+        // the submission, so the submission id is the whole handle on the undo.
+        if let releaseAt, let submissionID {
+            beginUndoWindow(
+                PendingSend(
+                    submissionID: submissionID,
+                    subject: draft.windowTitle,
+                    fileInMailboxID: fileInMailboxID,
+                    sendAt: releaseAt
+                )
+            )
+        }
+    }
+
+    /// Where a sent message is filed.
+    ///
+    /// A message the user scheduled hasn't been sent yet, so it belongs in the
+    /// account's own Scheduled queue rather than in Sent, where it would read
+    /// as already gone. Sent is the fallback for an account without that
+    /// mailbox.
+    ///
+    /// The few seconds of an undo hold deliberately don't route here. Nobody
+    /// thinks of pressing Send as scheduling, and it keeps the ordinary send
+    /// path on the behaviour it has always had — which matters while it is
+    /// unconfirmed whether the server files a released message into Sent
+    /// itself. If it does, this can widen to every held send.
+    private func filingMailboxID(isScheduled: Bool) -> String? {
+        if isScheduled, let scheduled = mailbox(role: "scheduled")?.id {
+            return scheduled
+        }
+
+        return mailbox(role: "sent")?.id
+    }
+
+    /// Recalls the held message: cancels the submission and, only if that
+    /// worked, puts the message back in Drafts.
+    func undoSend() async {
+        guard let pending = pendingSend else {
+            return
+        }
+
+        // Cleared first: the offer is spent either way, and leaving the banner
+        // up during the round trip invites a second tap on a submission that is
+        // already being cancelled.
+        clearUndoWindow()
+
+        do {
+            let context = try await apiContext()
+
+            guard let draftsMailboxID = mailbox(role: "drafts")?.id else {
+                throw JMAPError.missingMailbox("Drafts")
+            }
+
+            try await context.client.cancelSubmission(
+                session: context.session,
+                submissionAccountID: context.session.submissionAccountID ?? context.accountID,
+                submissionID: pending.submissionID,
+                draftsMailboxID: draftsMailboxID,
+                fileInMailboxID: pending.fileInMailboxID
+            )
+
+            await refreshIfViewing(mailboxID: pending.fileInMailboxID)
+            await refreshIfViewing(mailboxRole: "drafts")
+        } catch {
+            // The window is narrow and the race is real: the server may have
+            // released the message between the banner being drawn and the tap.
+            errorMessage = "The message could not be recalled: \(error.localizedDescription)"
+        }
+    }
+
+    private func beginUndoWindow(_ pending: PendingSend) {
+        undoWindowTask?.cancel()
+        pendingSend = pending
+
+        undoWindowTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(max(0, pending.undoUntil.timeIntervalSinceNow)))
+
+            guard !Task.isCancelled else {
+                return
+            }
+
+            await self?.expireUndoWindow(submissionID: pending.submissionID)
+        }
+    }
+
+    /// Only clears the banner it was started for: a second send during the
+    /// first one's window replaces `pendingSend`, and the older timer must not
+    /// then dismiss the newer offer.
+    private func expireUndoWindow(submissionID: String) {
+        guard pendingSend?.submissionID == submissionID else {
+            return
+        }
+
+        pendingSend = nil
+    }
+
+    func clearUndoWindow() {
+        undoWindowTask?.cancel()
+        undoWindowTask = nil
+        pendingSend = nil
     }
 
     private func requireIdentity(for draft: ComposeDraft) throws -> MailIdentity {
@@ -1417,7 +1713,11 @@ final class MailStore: ObservableObject {
     }
 
     private func refreshIfViewing(mailboxRole: String) async {
-        guard let mailboxID = mailbox(role: mailboxRole)?.id, selectedMailboxID == mailboxID else {
+        await refreshIfViewing(mailboxID: mailbox(role: mailboxRole)?.id)
+    }
+
+    private func refreshIfViewing(mailboxID: Mailbox.ID?) async {
+        guard let mailboxID, selectedMailboxID == mailboxID else {
             return
         }
 

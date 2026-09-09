@@ -595,6 +595,15 @@ final class JMAPClient {
     ///
     /// `onSuccessUpdateEmail` is what moves the message out of Drafts and into
     /// Sent, so the transition only happens if the submission itself succeeded.
+    ///
+    /// - Parameter sendAt: when the server should release the message. A future
+    ///   date makes the submission cancellable until then — which is both
+    ///   "send later" and, at a few seconds out, "undo send". Servers cap this
+    ///   at `maxDelayedSend`; the caller clamps.
+    /// - Returns: the submission's id, the handle a later cancel needs. Nil if
+    ///   the server answered without one — the mail still went, so that is not
+    ///   an error, only an undo the app can't offer.
+    @discardableResult
     func send(
         session: JMAPSession,
         accountID: String,
@@ -602,8 +611,9 @@ final class JMAPClient {
         draft: ComposeDraft,
         identity: MailIdentity,
         draftsMailboxID: String,
-        sentMailboxID: String?
-    ) async throws {
+        fileInMailboxID: String?,
+        sendAt: Date? = nil
+    ) async throws -> String? {
         var emailArguments: [String: Any] = [
             "accountId": accountID,
             "create": [
@@ -621,32 +631,22 @@ final class JMAPClient {
             emailArguments["update"] = [originalEmailID: ["keywords/\(keyword)": true]]
         }
 
-        var onSuccess: [String: Any] = ["keywords/$draft": NSNull()]
-        if let sentMailboxID {
-            onSuccess["mailboxIds/\(sentMailboxID)"] = true
-            onSuccess["mailboxIds/\(draftsMailboxID)"] = NSNull()
-        }
-
-        let submissionArguments: [String: Any] = [
-            "accountId": submissionAccountID,
-            "create": [
-                Self.submissionCreationID: [
-                    "emailId": "#\(Self.draftCreationID)",
-                    "identityId": identity.id,
-                    "envelope": [
-                        "mailFrom": ["email": identity.email],
-                        "rcptTo": draft.allRecipients.map { ["email": $0.email] }
-                    ]
-                ]
-            ],
-            "onSuccessUpdateEmail": ["#\(Self.submissionCreationID)": onSuccess]
-        ]
-
         let response = try await call(
             apiURL: session.apiURL,
             methodCalls: [
                 ["Email/set", emailArguments, "createDraft"],
-                ["EmailSubmission/set", submissionArguments, "submit"]
+                [
+                    "EmailSubmission/set",
+                    Self.submitArguments(
+                        accountID: submissionAccountID,
+                        draft: draft,
+                        identity: identity,
+                        draftsMailboxID: draftsMailboxID,
+                        fileInMailboxID: fileInMailboxID,
+                        sendAt: sendAt
+                    ),
+                    "submit"
+                ]
             ],
             using: JMAPCapability.submission
         )
@@ -656,7 +656,128 @@ final class JMAPClient {
 
         let submissionPayload = try response.payload(named: "EmailSubmission/set", clientID: "submit")
         try Self.throwIfRejected(submissionPayload, key: "notCreated")
+
+        return Self.createdID(in: submissionPayload, creationID: Self.submissionCreationID)
     }
+
+    /// The `EmailSubmission/set` half of a send, back-referencing the `Email`
+    /// created alongside it.
+    ///
+    /// - Parameter fileInMailboxID: where the message goes once the submission
+    ///   is accepted — Sent for an immediate send, Scheduled for one the server
+    ///   is holding. The caller chooses, because only it knows which mailboxes
+    ///   this account actually has.
+    static func submitArguments(
+        accountID: String,
+        draft: ComposeDraft,
+        identity: MailIdentity,
+        draftsMailboxID: String,
+        fileInMailboxID: String?,
+        sendAt: Date?
+    ) -> [String: Any] {
+        var onSuccess: [String: Any] = ["keywords/$draft": NSNull()]
+        if let fileInMailboxID {
+            onSuccess["mailboxIds/\(fileInMailboxID)"] = true
+            onSuccess["mailboxIds/\(draftsMailboxID)"] = NSNull()
+        }
+
+        var submission: [String: Any] = [
+            "emailId": "#\(draftCreationID)",
+            "identityId": identity.id,
+            "envelope": [
+                "mailFrom": ["email": identity.email],
+                "rcptTo": draft.allRecipients.map { ["email": $0.email] }
+            ]
+        ]
+
+        // Omitted rather than sent as null for an immediate send: RFC 8621 7.1
+        // defaults `sendAt` to "now", and a server that caps `maxDelayedSend`
+        // at 0 rejects the property outright.
+        if let sendAt {
+            submission["sendAt"] = utcDate(sendAt)
+        }
+
+        return [
+            "accountId": accountID,
+            "create": [submissionCreationID: submission],
+            "onSuccessUpdateEmail": ["#\(submissionCreationID)": onSuccess]
+        ]
+    }
+
+    /// Cancels a submission the server is still holding and puts the message
+    /// back in Drafts, editable, as if it had never been sent.
+    ///
+    /// The revert rides on `onSuccessUpdateEmail` rather than a second method
+    /// call: JMAP runs every call in a request whatever the one before it did,
+    /// so a separate `Email/set` would drag a message back out of Sent even
+    /// when the cancel had failed and the mail was already gone.
+    func cancelSubmission(
+        session: JMAPSession,
+        submissionAccountID: String,
+        submissionID: String,
+        draftsMailboxID: String,
+        fileInMailboxID: String?
+    ) async throws {
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "EmailSubmission/set",
+                    Self.cancelArguments(
+                        accountID: submissionAccountID,
+                        submissionID: submissionID,
+                        draftsMailboxID: draftsMailboxID,
+                        fileInMailboxID: fileInMailboxID
+                    ),
+                    "cancel"
+                ]
+            ],
+            using: JMAPCapability.submission
+        )
+
+        let payload = try response.payload(named: "EmailSubmission/set", clientID: "cancel")
+        try Self.throwIfRejected(payload, key: "notUpdated")
+    }
+
+    /// - Parameter fileInMailboxID: the mailbox the send filed it into, which
+    ///   it has to leave on the way back to Drafts.
+    static func cancelArguments(
+        accountID: String,
+        submissionID: String,
+        draftsMailboxID: String,
+        fileInMailboxID: String?
+    ) -> [String: Any] {
+        // The exact inverse of the send's `onSuccessUpdateEmail`.
+        var revert: [String: Any] = [
+            "keywords/$draft": true,
+            "mailboxIds/\(draftsMailboxID)": true
+        ]
+        if let fileInMailboxID {
+            revert["mailboxIds/\(fileInMailboxID)"] = NSNull()
+        }
+
+        return [
+            "accountId": accountID,
+            "update": [submissionID: ["undoStatus": "canceled"]],
+            "onSuccessUpdateEmail": [submissionID: revert]
+        ]
+    }
+
+    private static func createdID(in payload: [String: Any], creationID: String) -> String? {
+        ((payload["created"] as? [String: Any])?[creationID] as? [String: Any])?["id"] as? String
+    }
+
+    /// RFC 8620 1.4 `UTCDate`: seconds precision, always `Z`.
+    static func utcDate(_ date: Date) -> String {
+        utcDateFormatter.string(from: date)
+    }
+
+    private static let utcDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter
+    }()
 
     private static let draftCreationID = "draft"
     private static let submissionCreationID = "submission"

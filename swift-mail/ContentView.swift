@@ -44,9 +44,19 @@ private struct MailHomeView: View {
         }
         .toolbar { toolbar }
         .safeAreaInset(edge: .bottom) {
-            if let message = store.backgroundErrorMessage {
-                BackgroundErrorBanner(message: message) {
-                    store.backgroundErrorMessage = nil
+            VStack(spacing: 0) {
+                if let pending = store.pendingSend {
+                    UndoSendBanner(pending: pending) {
+                        Task { await store.undoSend() }
+                    } onDismiss: {
+                        store.clearUndoWindow()
+                    }
+                }
+
+                if let message = store.backgroundErrorMessage {
+                    BackgroundErrorBanner(message: message) {
+                        store.backgroundErrorMessage = nil
+                    }
                 }
             }
         }
@@ -203,6 +213,55 @@ private struct MailHomeView: View {
 
     private func compose(_ draft: ComposeDraft) {
         openWindow(id: ComposeWindow.id, value: draft)
+    }
+}
+
+/// The undo offer for a message the server is still holding.
+///
+/// The countdown is the whole point — it says how long the offer has left — so
+/// it ticks off a `TimelineView` rather than a timer the view has to own.
+/// Dismissing only drops the banner: the message still goes.
+private struct UndoSendBanner: View {
+    let pending: PendingSend
+    let onUndo: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            Image(systemName: "paperplane")
+                .foregroundStyle(.secondary)
+
+            Text(pending.subject)
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text("Sending \(pending.releaseDescription(at: context.date))")
+                    .font(.callout)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: Theme.Spacing.sm)
+
+            Button("Undo Send", action: onUndo)
+
+            Button {
+                onDismiss()
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Dismiss. The message still sends.")
+        }
+        .padding(.horizontal, Theme.Spacing.lg)
+        .padding(.vertical, Theme.Spacing.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.bar)
+        .overlay(alignment: .top) { Divider() }
+        .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 }
 

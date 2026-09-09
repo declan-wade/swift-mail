@@ -99,6 +99,35 @@ nonisolated struct MailTag: Identifiable, Hashable, Codable {
         return pattern.hasPrefix("@") ? pattern : nil
     }
 
+    /// The stored form of an address a tag can match on, or nil if it isn't
+    /// one. Accepts a plain address and both wildcard spellings.
+    ///
+    /// Tagging is about the addresses mail *reaches*, which is a wider set than
+    /// the account's sending identities: a Fastmail alias you only receive at,
+    /// an external Outlook or Gmail account, an address on a raw SMTP server.
+    /// None of those need to be an `Identity` to be worth colouring.
+    static func normalizedAddress(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        guard !trimmed.isEmpty, !trimmed.contains(where: \.isWhitespace) else {
+            return nil
+        }
+
+        if let domain = wildcardDomain(trimmed) {
+            return isDomain(domain.dropFirst()) ? trimmed : nil
+        }
+
+        guard let at = trimmed.firstIndex(of: "@"), at != trimmed.startIndex else {
+            return nil
+        }
+
+        return isDomain(trimmed[trimmed.index(after: at)...]) ? trimmed : nil
+    }
+
+    private static func isDomain(_ domain: Substring) -> Bool {
+        domain.contains(".") && !domain.hasPrefix(".") && !domain.hasSuffix(".")
+    }
+
     /// What to hand the server for one alias. A wildcard has no literal form
     /// to match, so it searches for its domain instead.
     private static func filterText(_ address: String) -> String {

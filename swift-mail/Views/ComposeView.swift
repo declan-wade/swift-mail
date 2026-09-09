@@ -46,6 +46,10 @@ struct ComposeView: View {
     @State private var isSending = false
     @State private var isSaving = false
     @State private var isConfirmingEmptySubject = false
+    /// Carried across the empty-subject confirmation so confirming a scheduled
+    /// send still schedules it.
+    @State private var scheduledSendAt: Date?
+    @State private var isPickingSendTime = false
     @State private var errorMessage: String?
     @State private var isChoosingAttachments = false
     @State private var isAttaching = false
@@ -192,10 +196,15 @@ struct ComposeView: View {
             "Send without a subject?",
             isPresented: $isConfirmingEmptySubject
         ) {
-            Button("Send") {
-                Task { await performSend() }
+            Button(scheduledSendAt == nil ? "Send" : "Schedule") {
+                Task { await performSend(at: scheduledSendAt) }
             }
             Button("Cancel", role: .cancel) {}
+        }
+        .sheet(isPresented: $isPickingSendTime) {
+            ScheduleSendSheet(latest: Date().addingTimeInterval(TimeInterval(store.maxDelayedSend))) { date in
+                requestSend(at: date)
+            }
         }
         .alert("Compose Error", isPresented: Binding(
             get: { errorMessage != nil },
@@ -351,14 +360,24 @@ struct ComposeView: View {
         }
 
         ToolbarItem {
-            Button {
-                requestSend()
-            } label: {
-                if isSending {
-                    ProgressView()
-                        .controlSize(.small)
+            // A split button when the server will hold mail, a plain one when
+            // it won't: a menu whose only entries are unavailable is worse than
+            // no menu.
+            Group {
+                if store.supportsDelayedSend {
+                    Menu {
+                        sendLaterOptions
+                    } label: {
+                        sendLabel
+                    } primaryAction: {
+                        requestSend()
+                    }
                 } else {
-                    Label("Send", systemImage: "paperplane.fill")
+                    Button {
+                        requestSend()
+                    } label: {
+                        sendLabel
+                    }
                 }
             }
             .help("Send (⌘↩)")
@@ -368,12 +387,41 @@ struct ComposeView: View {
         }
     }
 
+    @ViewBuilder
+    private var sendLabel: some View {
+        if isSending {
+            ProgressView()
+                .controlSize(.small)
+        } else {
+            Label("Send", systemImage: "paperplane.fill")
+        }
+    }
+
+    @ViewBuilder
+    private var sendLaterOptions: some View {
+        ForEach(SendLaterPreset.available(from: Date(), within: store.maxDelayedSend), id: \.preset.id) { option in
+            Button {
+                requestSend(at: option.date)
+            } label: {
+                Text(option.preset.label)
+                Text(option.date.formatted(date: .abbreviated, time: .shortened))
+            }
+        }
+
+        Divider()
+
+        Button("Send at Time…") {
+            isPickingSendTime = true
+        }
+    }
+
     private var canSend: Bool {
         draft.hasRecipients && !isSending && !isSaving
     }
 
-    private func requestSend() {
+    private func requestSend(at sendAt: Date? = nil) {
         commitPendingEdits()
+        scheduledSendAt = sendAt
 
         guard draft.hasRecipients else {
             errorMessage = "Add at least one recipient before sending."
@@ -385,16 +433,16 @@ struct ComposeView: View {
             return
         }
 
-        Task { await performSend() }
+        Task { await performSend(at: sendAt) }
     }
 
-    private func performSend() async {
+    private func performSend(at sendAt: Date?) async {
         isSending = true
-        statusMessage = "Sending…"
+        statusMessage = sendAt == nil ? "Sending…" : "Scheduling…"
         defer { isSending = false }
 
         do {
-            try await store.send(draft)
+            try await store.send(draft, sendAt: sendAt)
             // The message is gone; there is nothing left unsaved, and without
             // this the close below would raise the save-draft prompt on a
             // message that has just been sent.
@@ -648,5 +696,60 @@ private struct ComposeStatusBar: View {
 
     private var wordCount: Int {
         markdown.split(whereSeparator: \.isWhitespace).count
+    }
+}
+
+// MARK: - Scheduling
+
+/// Picks an arbitrary release time, bounded by what the server will hold.
+///
+/// The bound is the point: a picker that accepts a date the server then refuses
+/// turns a scheduling mistake into a failed send.
+private struct ScheduleSendSheet: View {
+    let latest: Date
+    let onSchedule: (Date) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var date: Date
+
+    init(latest: Date, onSchedule: @escaping (Date) -> Void) {
+        self.latest = latest
+        self.onSchedule = onSchedule
+        // An hour out, or the latest the server allows if that is sooner.
+        _date = State(initialValue: min(Date().addingTimeInterval(3600), latest))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
+            Text("Send Later")
+                .font(.headline)
+
+            DatePicker(
+                "Send at",
+                selection: $date,
+                in: Date()...latest,
+                displayedComponents: [.date, .hourAndMinute]
+            )
+            .datePickerStyle(.field)
+
+            Text("This server holds messages until \(latest.formatted(date: .abbreviated, time: .shortened)).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+
+                Button("Schedule") {
+                    dismiss()
+                    onSchedule(date)
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(Theme.Spacing.lg)
+        .frame(width: 360)
     }
 }

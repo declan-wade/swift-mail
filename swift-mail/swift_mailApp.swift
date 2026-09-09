@@ -18,6 +18,9 @@ struct swift_mailApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(store: store)
+                // The delegate needs the store to answer the quit prompt, and
+                // this is the one place both are in scope.
+                .onAppear { appDelegate.store = store }
         }
         .commands {
             ComposeCommands(store: store)
@@ -38,8 +41,35 @@ struct swift_mailApp: App {
 /// so a notification the user acted on to *open* the app is delivered to us.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Weak: the store belongs to the `App`, which outlives this anyway.
+    weak var store: MailStore?
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         _ = NotificationService.shared
+    }
+
+    /// Warns before quitting while a message is still recallable.
+    ///
+    /// Not because quitting would stop the send — the server is holding the
+    /// message and will release it whether or not this app is running — but
+    /// because the undo is the one part that lives only here. Quitting spends
+    /// it silently otherwise.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let pending = store?.pendingSend else {
+            return .terminateNow
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "\u{201C}\(pending.subject)\u{201D} hasn't sent yet"
+        alert.informativeText = "It sends \(pending.releaseDescription()). Quitting won't stop that "
+            + "— the server is holding the message, not this app — but you'll lose the chance to undo it."
+
+        // Cancel first, so it takes Return: an alert that exists to make
+        // someone read it is defeated by a default button that dismisses it.
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Quit Anyway")
+
+        return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow
     }
 }
 

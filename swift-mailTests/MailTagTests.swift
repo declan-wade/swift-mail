@@ -156,4 +156,34 @@ struct MailTagTests {
         #expect(second.color != personal.color)
         #expect(MailTag.suggestedName(existing: [personal, second]) == "Tag 3")
     }
+
+    // MARK: - Addresses the pane will accept
+
+    @Test("An address is normalised to its stored form")
+    func normalisesAddresses() {
+        #expect(MailTag.normalizedAddress("  DWade@Outlook.com.au ") == "dwade@outlook.com.au")
+        #expect(MailTag.normalizedAddress("gundamire@gmail.com") == "gundamire@gmail.com")
+        // Both wildcard spellings survive: the matcher understands each.
+        #expect(MailTag.normalizedAddress("*@codexgroup.com.au") == "*@codexgroup.com.au")
+        #expect(MailTag.normalizedAddress("@codexgroup.com.au") == "@codexgroup.com.au")
+    }
+
+    @Test("Anything that couldn't match a message is refused")
+    func refusesNonAddresses() {
+        for text in ["", "   ", "dwade", "@", "dwade@", "@localhost", "dwade@x", "a b@example.com", "dwade@example."] {
+            #expect(MailTag.normalizedAddress(text) == nil, "accepted \(text)")
+        }
+    }
+
+    @Test("A hand-added external address tags its mail like any identity would")
+    func externalAddressMatches() throws {
+        let address = try #require(MailTag.normalizedAddress("dwade@outlook.com.au"))
+        let tag = MailTag(name: "Personal", color: .blue, addresses: [address])
+
+        // Mail collected from an external account keeps the headers that
+        // account received it with, so the address is in `to` — there is no
+        // Fastmail delivery header naming it.
+        #expect(tag.matches(try preview(to: ["DWade@outlook.com.au"])))
+        #expect(!tag.matches(try preview(to: ["someone@elsewhere.test"])))
+    }
 }

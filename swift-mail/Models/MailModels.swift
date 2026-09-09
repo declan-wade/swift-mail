@@ -73,6 +73,24 @@ nonisolated struct JMAPSession: Decodable {
         capabilities?["urn:ietf:params:jmap:core"]
     }
 
+    /// How long this account may hold a submission before it is released
+    /// (RFC 8621 7). `0` — the spec's own default when the property is absent
+    /// — means the server sends immediately and `sendAt` must not be set, so
+    /// this doubles as the "is delayed send available" check.
+    ///
+    /// The account's own capability wins: a server can implement delayed send
+    /// without granting it to every account on it.
+    func maxDelayedSend(accountID: String?) -> Int {
+        let key = "urn:ietf:params:jmap:submission"
+
+        if let accountID,
+           let limit = accounts?[accountID]?.accountCapabilities?[key]?.maxDelayedSend {
+            return limit
+        }
+
+        return capabilities?[key]?.maxDelayedSend ?? 0
+    }
+
     /// Expands `uploadUrl` for one account. Same brace-encoding caveat as
     /// `downloadURL`: `URL(string:)` percent-encodes the placeholder on decode.
     func uploadURL(accountID: String) -> URL? {
@@ -183,9 +201,13 @@ nonisolated struct JMAPCapabilityProperties: Decodable {
     let maxCallsInRequest: Int?
     let maxObjectsInGet: Int?
     let maxObjectsInSet: Int?
+    /// `urn:ietf:params:jmap:submission`'s (RFC 8621 7): how many seconds a
+    /// submission may be held before release.
+    let maxDelayedSend: Int?
 
     private enum CodingKeys: String, CodingKey {
         case maxSizeUpload, maxSizeRequest, maxCallsInRequest, maxObjectsInGet, maxObjectsInSet
+        case maxDelayedSend
     }
 
     init(from decoder: Decoder) {
@@ -207,6 +229,7 @@ nonisolated struct JMAPCapabilityProperties: Decodable {
         maxCallsInRequest = limit(.maxCallsInRequest)
         maxObjectsInGet = limit(.maxObjectsInGet)
         maxObjectsInSet = limit(.maxObjectsInSet)
+        maxDelayedSend = limit(.maxDelayedSend)
     }
 }
 
@@ -239,8 +262,9 @@ nonisolated struct Mailbox: Identifiable, Hashable, Codable {
 
     var iconName: String { icon ?? "folder" }
 
-    /// Matched on role first, then on name: JMAP has no role for Fastmail's
-    /// Snoozed, Scheduled or Memos mailboxes.
+    /// Matched on role first, then on name. Fastmail does report `snoozed`,
+    /// `scheduled` and `memos` as roles despite them not being RFC 8621's; the
+    /// name fallback is for servers that don't.
     /// ponytail: name matching also claims a user folder called e.g. "Notes";
     /// switch to a server-provided role if one ever appears.
     private var icon: String? {
