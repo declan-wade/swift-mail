@@ -118,6 +118,9 @@ final class MailStore: ObservableObject {
     /// single element for a message with no siblings, which the reader treats
     /// as "no conversation to show".
     @Published var conversation: [EmailPreview] = []
+    /// Changes made here that the server hasn't accepted yet. Non-zero means
+    /// the app is holding work for a connection it doesn't have.
+    @Published private(set) var pendingOutboxCount = 0
 
     @Published private var session: JMAPSession?
     private var accountID: String?
@@ -139,6 +142,7 @@ final class MailStore: ObservableObject {
     private var emailState: String?
     private var mailboxState: String?
     private let cache = MailCache.shared
+    private var isDrainingOutbox = false
     private var hasWiredNotificationHandler = false
     private let notificationService = NotificationService.shared
 
@@ -146,6 +150,10 @@ final class MailStore: ObservableObject {
     /// Cap on `Email/changes` pages walked in one sync, so a pathological
     /// change backlog can't spin here indefinitely.
     private let maxChangePages = 25
+    /// How many times a change may be refused before it is dropped rather than
+    /// retried forever. Only server answers count towards this; being offline
+    /// never does.
+    private static let maxOutboxAttempts = 5
 
     /// The query the currently displayed `emails` were fetched with, so
     /// background refreshes and load-more stay consistent with what's on screen.
@@ -375,6 +383,7 @@ final class MailStore: ObservableObject {
         // re-querying the mailbox from scratch.
         emailState = cache.syncState(for: "Email")
         mailboxState = cache.syncState(for: "Mailbox")
+        pendingOutboxCount = cache.pendingOutbox().count
 
         guard let selectedMailboxID else {
             return
@@ -424,7 +433,7 @@ final class MailStore: ObservableObject {
 
         UserDefaults.standard.set(data, forKey: accountStorageKey)
         try KeychainStore.saveToken(bearerToken)
-        cache.clear()
+        cache.reset(accountKey: Self.accountKey(for: account))
 
         self.account = account
         self.bearerToken = bearerToken
@@ -493,6 +502,9 @@ final class MailStore: ObservableObject {
             await loadIdentities()
             cache.setMailboxes(mailboxes)
             cache.setIdentities(identities)
+
+            // Reconnecting is the moment anything queued while offline can go.
+            await drainOutbox()
 
             if let selectedMailboxID {
                 await loadEmails(mailboxID: selectedMailboxID)
@@ -710,27 +722,17 @@ final class MailStore: ObservableObject {
     }
 
     func setReadState(emailID: EmailPreview.ID, isRead: Bool) async {
-        guard !updatingReadStateEmailIDs.contains(emailID),
-              let client = makeClient(),
-              let session,
-              let accountID else {
+        let wasUnread = emails.first { $0.id == emailID }?.isUnread ?? selectedEmail?.isUnread ?? false
+        guard wasUnread == isRead else {
             return
         }
 
-        let previousEmail = emails.first { $0.id == emailID }
-        let wasUnread = previousEmail?.isUnread ?? selectedEmail?.isUnread ?? false
-
-        updatingReadStateEmailIDs.insert(emailID)
         errorMessage = nil
+        applyReadState(emailID: emailID, isRead: isRead, wasUnread: wasUnread)
+        cacheOptimistic(emailID: emailID) { $0.settingSeen(isRead) }
+        enqueue(.keyword("$seen", isSet: isRead), for: emailID)
 
-        do {
-            try await client.setEmailSeen(session: session, accountID: accountID, emailID: emailID, isSeen: isRead)
-            applyReadState(emailID: emailID, isRead: isRead, wasUnread: wasUnread)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-
-        updatingReadStateEmailIDs.remove(emailID)
+        await drainOutbox()
     }
 
     func toggleReadState(emailID: EmailPreview.ID) async {
@@ -739,56 +741,198 @@ final class MailStore: ObservableObject {
     }
 
     func toggleFlag(emailID: EmailPreview.ID) async {
-        guard !updatingFlagEmailIDs.contains(emailID),
-              let client = makeClient(),
-              let session,
-              let accountID else {
-            return
-        }
-
         let wasFlagged = emails.first { $0.id == emailID }?.isFlagged ?? selectedEmail?.isFlagged ?? false
         let isFlagged = !wasFlagged
 
-        updatingFlagEmailIDs.insert(emailID)
         errorMessage = nil
+        applyFlagState(emailID: emailID, isFlagged: isFlagged)
+        cacheOptimistic(emailID: emailID) { $0.settingFlagged(isFlagged) }
+        enqueue(.keyword("$flagged", isSet: isFlagged), for: emailID)
 
-        do {
-            try await client.setEmailKeyword(session: session, accountID: accountID, emailID: emailID, keyword: "$flagged", isSet: isFlagged)
-            applyFlagState(emailID: emailID, isFlagged: isFlagged)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-
-        updatingFlagEmailIDs.remove(emailID)
+        await drainOutbox()
     }
 
     /// Moves an email to the mailbox for `role` (`"archive"` or `"trash"`) and,
     /// on success, advances the list selection so the detail pane doesn't go
     /// blank. Mirrors `setReadState`'s optimistic-update-then-roll-back shape.
     func moveEmail(emailID: EmailPreview.ID, toRole role: String) async {
-        guard !movingEmailIDs.contains(emailID),
-              let client = makeClient(),
-              let session,
-              let accountID else {
-            return
-        }
-
         guard let destination = mailbox(role: role) else {
             errorMessage = JMAPError.missingMailbox(role.capitalized).localizedDescription
             return
         }
 
-        movingEmailIDs.insert(emailID)
         errorMessage = nil
+        cacheOptimistic(emailID: emailID) { $0.settingMailbox(destination.id) }
+        applyMove(emailID: emailID)
+        enqueue(.move(mailboxID: destination.id), for: emailID)
 
-        do {
-            try await client.moveEmail(session: session, accountID: accountID, emailID: emailID, toMailboxID: destination.id)
-            applyMove(emailID: emailID)
-        } catch {
-            errorMessage = error.localizedDescription
+        await drainOutbox()
+    }
+
+    // MARK: - Outbox
+
+    /// Records a change the user has already seen applied, so the obligation to
+    /// send it survives a failed request, a quit, and a flat network.
+    private func enqueue(_ action: OutboxEntry.Action, for emailID: EmailPreview.ID) {
+        cache.enqueue(OutboxEntry(emailID: emailID, action: action))
+        pendingOutboxCount = cache.pendingOutbox().count
+    }
+
+    /// Mirrors an optimistic change into the cache, so a relaunch before the
+    /// send lands shows what the user did rather than what the server last said.
+    private func cacheOptimistic(emailID: EmailPreview.ID, _ change: (EmailPreview) -> EmailPreview) {
+        guard let current = emails.first(where: { $0.id == emailID }) ?? cache.message(id: emailID) else {
+            return
         }
 
-        movingEmailIDs.remove(emailID)
+        cache.store(previews: [change(current)])
+    }
+
+    /// Server truth with this session's un-sent changes laid back on top.
+    ///
+    /// This is the ordering rule the whole outbox rests on: `Email/changes` is
+    /// the only writer of server state, the outbox is the only writer to the
+    /// server, and where they disagree the outbox wins until it drains.
+    /// Without this, a delta computed before a pending archive puts the message
+    /// back in the list a moment after the user archived it.
+    private func applyingPending(to preview: EmailPreview) -> EmailPreview {
+        cache.pendingOutbox(for: preview.id).reduce(preview) { $1.apply(to: $0) }
+    }
+
+    /// Sends what is owed, oldest first, stopping at the first entry the
+    /// network refuses so a flat connection doesn't burn through the queue.
+    func drainOutbox() async {
+        guard !isDrainingOutbox else {
+            return
+        }
+
+        let pending = cache.pendingOutbox()
+        guard !pending.isEmpty else {
+            pendingOutboxCount = 0
+            return
+        }
+
+        // No session means offline, not rejected. Leaving the queue untouched
+        // is what keeps `attempts` a count of the server's refusals rather than
+        // a count of how long the user was on a train.
+        guard let client = makeClient(), let session, let accountID else {
+            pendingOutboxCount = pending.count
+            return
+        }
+
+        isDrainingOutbox = true
+        defer { isDrainingOutbox = false }
+
+        for entry in pending {
+            markInFlight(entry, true)
+
+            do {
+                try await send(entry, client: client, session: session, accountID: accountID)
+                cache.removeOutbox(id: entry.id)
+            } catch {
+                markInFlight(entry, false)
+
+                guard Self.isWorthRetrying(error), entry.attempts + 1 < Self.maxOutboxAttempts else {
+                    // The server's final word, or a change that has been refused
+                    // too often to keep. Drop it and put the screen back to the
+                    // truth rather than leaving a change that will never land.
+                    cache.removeOutbox(id: entry.id)
+                    errorMessage = error.localizedDescription
+                    await rollBack(entry)
+                    continue
+                }
+
+                cache.recordOutboxAttempt(id: entry.id)
+                // Ordering matters — a later change to the same message must not
+                // overtake this one — so the drain stops here and retries on the
+                // next refresh, push, or mutation.
+                break
+            }
+
+            markInFlight(entry, false)
+        }
+
+        pendingOutboxCount = cache.pendingOutbox().count
+    }
+
+    private func send(_ entry: OutboxEntry, client: JMAPClient, session: JMAPSession, accountID: String) async throws {
+        switch entry.action {
+        case .keyword(let keyword, let isSet):
+            try await client.setEmailKeyword(
+                session: session,
+                accountID: accountID,
+                emailID: entry.emailID,
+                keyword: keyword,
+                isSet: isSet
+            )
+        case .move(let mailboxID):
+            try await client.moveEmail(
+                session: session,
+                accountID: accountID,
+                emailID: entry.emailID,
+                toMailboxID: mailboxID
+            )
+        }
+    }
+
+    /// A rejection is the server's final answer; anything that never reached it
+    /// is worth another go. An unrecognised failure is retried, but counted, so
+    /// a poison entry can't wedge the queue forever.
+    private static func isWorthRetrying(_ error: Error) -> Bool {
+        switch error {
+        case JMAPError.setError, JMAPError.methodError, JMAPError.emailNotFound:
+            false
+        case JMAPError.httpStatus(let code, _):
+            code == 429 || (500...599).contains(code)
+        default:
+            true
+        }
+    }
+
+    /// Puts the screen back to the truth after a change the server refused.
+    /// A keyword is reversed in place; a move has to rebuild the list, because
+    /// the message was taken out of it and belongs back at its own date.
+    private func rollBack(_ entry: OutboxEntry) async {
+        if let server = try? await refetch(emailID: entry.emailID) {
+            cache.store(previews: [applyingPending(to: server)])
+        }
+
+        switch entry.action {
+        case .keyword("$seen", let isSet):
+            let wasUnread = !isSet
+            applyReadState(emailID: entry.emailID, isRead: !isSet, wasUnread: wasUnread)
+        case .keyword("$flagged", let isSet):
+            applyFlagState(emailID: entry.emailID, isFlagged: !isSet)
+        case .keyword:
+            break
+        case .move:
+            await reloadVisibleList()
+        }
+    }
+
+    private func refetch(emailID: EmailPreview.ID) async throws -> EmailPreview? {
+        guard let client = makeClient(), let session, let accountID else {
+            return nil
+        }
+
+        return try await client.fetchEmailPreviews(session: session, accountID: accountID, ids: [emailID]).first
+    }
+
+    private func markInFlight(_ entry: OutboxEntry, _ isInFlight: Bool) {
+        func update(_ set: inout Set<EmailPreview.ID>) {
+            if isInFlight {
+                set.insert(entry.emailID)
+            } else {
+                set.remove(entry.emailID)
+            }
+        }
+
+        switch entry.action {
+        case .keyword("$seen", _): update(&updatingReadStateEmailIDs)
+        case .keyword("$flagged", _): update(&updatingFlagEmailIDs)
+        case .keyword: break
+        case .move: update(&movingEmailIDs)
+        }
     }
 
     func archive(emailID: EmailPreview.ID) async {
@@ -1422,6 +1566,10 @@ final class MailStore: ObservableObject {
         if let email = change.state(for: "Email", accountID: accountID), email != emailState {
             await syncEmailChanges(newState: email)
         }
+
+        // The push loop doubles as the retry tick: a queue held back by a
+        // transient failure gets another go without a timer of its own.
+        await drainOutbox()
     }
 
     /// Re-reads mailboxes for their counts (drives the sidebar and the dock
@@ -1491,9 +1639,15 @@ final class MailStore: ObservableObject {
             )
 
             emailState = cursor
-            applyEmailDeltas(previews: previews, createdIDs: createdSet, destroyedIDs: destroyedSet)
+
+            // The server's view, corrected by anything still queued here. A
+            // delta computed before a pending archive would otherwise put the
+            // message back in the list a moment after the user archived it.
+            let reconciled = previews.map { applyingPending(to: $0) }
+
+            applyEmailDeltas(previews: reconciled, createdIDs: createdSet, destroyedIDs: destroyedSet)
             cache.remove(emailIDs: destroyedSet)
-            cache.store(previews: previews)
+            cache.store(previews: reconciled)
             // Without this the on-disk cursor goes stale while the app stays
             // open, and a long-running session still relaunches into a big diff.
             cacheVisibleList()
@@ -1524,7 +1678,6 @@ final class MailStore: ObservableObject {
             }
         }
 
-        let inboxID = mailboxes.first { $0.role == "inbox" }?.id
         let byID = Dictionary(previews.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
 
         // Updated messages already on screen: refresh in place so read/flag

@@ -23,9 +23,10 @@ struct MailCacheTests {
         let file = directory.appending(path: "cache.sqlite")
         let cache = MailCache.shared
         cache.open(accountKey: accountKey, at: file)
-        // The singleton may already be open from an earlier test; clearing gives
-        // each one an empty database without reaching for a second connection.
-        cache.clear()
+        // The singleton may already be open from an earlier test; resetting gives
+        // each one an empty database, still stamped with its owner, without
+        // reaching for a second connection.
+        cache.reset(accountKey: accountKey)
 
         return (cache, file)
     }
@@ -177,6 +178,101 @@ struct MailCacheTests {
         #expect(names.first?.contains("/") == false)
     }
 
+    // MARK: - Outbox
+
+    @Test("A queued change survives a relaunch")
+    func outboxSurvivesReopen() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "cache-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appending(path: "cache.sqlite")
+
+        let cache = MailCache.shared
+        cache.open(accountKey: "acct-a", at: file)
+        cache.reset(accountKey: "acct-a")
+        cache.enqueue(OutboxEntry(emailID: "E1", action: .move(mailboxID: "archive")))
+
+        // Quitting with work owed and coming back to find it gone is the whole
+        // failure this table exists to prevent.
+        cache.open(accountKey: "acct-a", at: directory.appending(path: "other.sqlite"))
+        cache.open(accountKey: "acct-a", at: file)
+
+        let pending = cache.pendingOutbox()
+        #expect(pending.count == 1)
+        #expect(pending.first?.emailID == "E1")
+        #expect(pending.first?.action == .move(mailboxID: "archive"))
+    }
+
+    @Test("Queued changes replay in the order they were made")
+    func outboxKeepsOrder() throws {
+        let (cache, _) = try openScratchCache()
+
+        cache.enqueue(OutboxEntry(emailID: "E1", action: .keyword("$seen", isSet: true)))
+        cache.enqueue(OutboxEntry(emailID: "E1", action: .move(mailboxID: "mb2")))
+        cache.enqueue(OutboxEntry(emailID: "E2", action: .keyword("$flagged", isSet: true)))
+
+        // "Mark read, then archive" has to reach the server in that order.
+        #expect(cache.pendingOutbox().map(\.emailID) == ["E1", "E1", "E2"])
+        #expect(cache.pendingOutbox(for: "E1").count == 2)
+        #expect(cache.pendingOutbox(for: "E2").map(\.action) == [.keyword("$flagged", isSet: true)])
+        #expect(cache.pendingOutbox(for: "never-touched").isEmpty)
+    }
+
+    @Test("Toggling the same thing twice sends one change, not two")
+    func outboxCoalesces() throws {
+        let (cache, _) = try openScratchCache()
+
+        cache.enqueue(OutboxEntry(emailID: "E1", action: .keyword("$seen", isSet: true)))
+        cache.enqueue(OutboxEntry(emailID: "E1", action: .keyword("$seen", isSet: false)))
+        cache.enqueue(OutboxEntry(emailID: "E1", action: .keyword("$seen", isSet: true)))
+
+        // Only the last word on a given keyword matters.
+        #expect(cache.pendingOutbox().map(\.action) == [.keyword("$seen", isSet: true)])
+
+        // A different keyword, and a move, are separate obligations.
+        cache.enqueue(OutboxEntry(emailID: "E1", action: .keyword("$flagged", isSet: true)))
+        cache.enqueue(OutboxEntry(emailID: "E1", action: .move(mailboxID: "mb2")))
+        cache.enqueue(OutboxEntry(emailID: "E1", action: .move(mailboxID: "mb3")))
+        #expect(cache.pendingOutbox().count == 3)
+        #expect(cache.pendingOutbox().last?.action == .move(mailboxID: "mb3"))
+    }
+
+    @Test("Sent changes leave the queue; refused ones are counted")
+    func outboxLifecycle() throws {
+        let (cache, _) = try openScratchCache()
+        let entry = OutboxEntry(emailID: "E1", action: .keyword("$seen", isSet: true))
+        cache.enqueue(entry)
+
+        let queued = try #require(cache.pendingOutbox().first)
+        cache.recordOutboxAttempt(id: queued.id)
+        cache.recordOutboxAttempt(id: queued.id)
+        // Attempts count the server's refusals, so a poison entry can be
+        // dropped rather than retried forever.
+        #expect(cache.pendingOutbox().first?.attempts == 2)
+
+        cache.removeOutbox(id: queued.id)
+        #expect(cache.pendingOutbox().isEmpty)
+    }
+
+    @Test("A pending change outranks the server's older answer")
+    func pendingChangeWinsOverADelta() throws {
+        let (cache, _) = try openScratchCache()
+        let server = try preview(mailboxes: ["mb1"], seen: false)
+
+        // The server's delta still has it unread in the inbox, because it was
+        // computed before these changes were sent.
+        let corrected = [
+            OutboxEntry(emailID: "E1", action: .keyword("$seen", isSet: true)),
+            OutboxEntry(emailID: "E1", action: .move(mailboxID: "mb2"))
+        ].reduce(server) { $1.apply(to: $0) }
+
+        #expect(!corrected.isUnread)
+        // A move replaces membership outright, so it leaves the inbox rather
+        // than showing in both folders.
+        #expect(corrected.mailboxIds?["mb2"] == true)
+        #expect(corrected.mailboxIds?["mb1"] == nil)
+    }
+
     @Test("Signing out takes the cached mail with it")
     func clearRemovesEverything() throws {
         let (cache, _) = try openScratchCache()
@@ -190,5 +286,10 @@ struct MailCacheTests {
         #expect(cache.page(mailboxID: "mb1", limit: 10).isEmpty)
         #expect(cache.syncState(for: "Email") == nil)
         #expect(cache.mailboxes().isEmpty)
+
+        // Including work it was still holding for the old account.
+        cache.enqueue(OutboxEntry(emailID: "E1", action: .move(mailboxID: "mb2")))
+        cache.clear()
+        #expect(cache.pendingOutbox().isEmpty)
     }
 }

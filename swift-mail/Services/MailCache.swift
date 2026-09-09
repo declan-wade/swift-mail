@@ -6,6 +6,57 @@ import SQLite3
 /// here, so every bind is copied.
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+/// One change the user made that the server has not accepted yet.
+///
+/// The point of writing these down is that a flag or an archive stops depending
+/// on the network being up at the moment it is tapped: the change lands on
+/// screen immediately, and the send is a separate obligation the app owes the
+/// server until it drains — across a relaunch if need be.
+nonisolated struct OutboxEntry: Identifiable, Hashable, Codable {
+    /// What to do. Deliberately a closed set: an outbox that can hold arbitrary
+    /// work is a job queue, and this only ever needs the two mutations the UI
+    /// actually offers.
+    enum Action: Hashable, Codable {
+        case keyword(String, isSet: Bool)
+        case move(mailboxID: String)
+    }
+
+    var id: UUID
+    var emailID: String
+    var action: Action
+    /// How many times the *server* has refused this. Never incremented while
+    /// offline, so it counts rejections rather than lost connectivity.
+    var attempts: Int
+    var queuedAt: Date
+
+    init(id: UUID = UUID(), emailID: String, action: Action, attempts: Int = 0, queuedAt: Date = Date()) {
+        self.id = id
+        self.emailID = emailID
+        self.action = action
+        self.attempts = attempts
+        self.queuedAt = queuedAt
+    }
+
+    /// Identifies changes that supersede one another. Toggling read three times
+    /// should send one update, not three, and only the last move matters.
+    var coalescingKey: String {
+        switch action {
+        case .keyword(let keyword, _): "keyword:\(keyword)"
+        case .move: "move"
+        }
+    }
+
+    /// The same change laid back over a preview the server just sent us.
+    func apply(to preview: EmailPreview) -> EmailPreview {
+        switch action {
+        case .keyword("$seen", let isSet): preview.settingSeen(isSet)
+        case .keyword("$flagged", let isSet): preview.settingFlagged(isSet)
+        case .keyword: preview
+        case .move(let mailboxID): preview.settingMailbox(mailboxID)
+        }
+    }
+}
+
 /// The on-disk mirror of one account: what the server said last time, so a
 /// launch has mail before the network answers and a folder switch doesn't drop
 /// back to a skeleton.
@@ -31,7 +82,7 @@ final class MailCache: @unchecked Sendable {
     static let shared = MailCache()
 
     /// Bump on any change an older file can't satisfy. The old file is dropped.
-    private static let schemaVersion = 1
+    private static let schemaVersion = 2
 
     /// Message bodies are the only unbounded table. Evicted oldest-first once
     /// the total passes this.
@@ -152,7 +203,17 @@ final class MailCache: @unchecked Sendable {
             bytes INTEGER,
             touched_at REAL);
 
+        CREATE TABLE IF NOT EXISTS outbox (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT UNIQUE,
+            email_id TEXT,
+            action_key TEXT,
+            action TEXT,
+            attempts INTEGER,
+            queued_at REAL);
+
         CREATE INDEX IF NOT EXISTS email_by_time ON email (received_at DESC);
+        CREATE INDEX IF NOT EXISTS outbox_by_email ON outbox (email_id);
         CREATE INDEX IF NOT EXISTS email_mailbox_lookup ON email_mailbox (mailbox_id);
         CREATE INDEX IF NOT EXISTS body_by_age ON email_body (touched_at);
         """)
@@ -167,6 +228,7 @@ final class MailCache: @unchecked Sendable {
         DROP TABLE IF EXISTS email;
         DROP TABLE IF EXISTS email_mailbox;
         DROP TABLE IF EXISTS email_body;
+        DROP TABLE IF EXISTS outbox;
         """)
 
         if let base = blobBase {
@@ -174,10 +236,21 @@ final class MailCache: @unchecked Sendable {
         }
     }
 
-    /// Signing out. Everything cached belonged to that account.
+    /// Signing out: everything cached belonged to that account, and nobody owns
+    /// the file now. The schema stamp stays, because it describes the file's
+    /// shape rather than its contents — dropping it would make the next `open`
+    /// read an empty cache as an incompatible one and discard it a second time.
     func clear() {
         dropEverything()
         createTables()
+        setMeta("schema_version", String(Self.schemaVersion))
+    }
+
+    /// Hands the file to a different account: empty, and stamped with its new
+    /// owner so the next launch recognises it instead of dropping it.
+    func reset(accountKey: String) {
+        clear()
+        setMeta("account_key", accountKey)
     }
 
     // MARK: - Sync cursors
@@ -305,6 +378,83 @@ final class MailCache: @unchecked Sendable {
                 run("DELETE FROM email_body WHERE id = ?;", bind: [id])
             }
         }
+    }
+
+    /// One message by id, wherever it currently sits. Used to build an
+    /// optimistic update for a message that has already left the visible list.
+    func message(id: String) -> EmailPreview? {
+        query("SELECT json FROM email WHERE id = ?;", bind: [id]) { $0.text(0) }
+            .compactMap { decode(EmailPreview.self, from: $0) }
+            .first
+    }
+
+    // MARK: - Outbox
+
+    /// Queues a change, replacing any pending change it supersedes. Ordering is
+    /// by insertion, so "mark read, then archive" replays in that order.
+    func enqueue(_ entry: OutboxEntry) {
+        guard let json = encode(entry.action) else {
+            return
+        }
+
+        transaction {
+            run("DELETE FROM outbox WHERE email_id = ? AND action_key = ?;",
+                bind: [entry.emailID, entry.coalescingKey])
+            run("""
+            INSERT INTO outbox (id, email_id, action_key, action, attempts, queued_at)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """, bind: [
+                entry.id.uuidString,
+                entry.emailID,
+                entry.coalescingKey,
+                json,
+                entry.attempts,
+                entry.queuedAt.timeIntervalSinceReferenceDate
+            ])
+        }
+    }
+
+    /// Everything still owed to the server, oldest first.
+    func pendingOutbox() -> [OutboxEntry] {
+        query("SELECT id, email_id, action, attempts, queued_at FROM outbox ORDER BY sequence;", bind: []) { row in
+            entry(from: row)
+        }
+    }
+
+    /// What is still owed for one message, so a server delta can be corrected
+    /// before it overwrites a change the user has already seen applied.
+    func pendingOutbox(for emailID: String) -> [OutboxEntry] {
+        query("""
+        SELECT id, email_id, action, attempts, queued_at FROM outbox
+        WHERE email_id = ? ORDER BY sequence;
+        """, bind: [emailID]) { row in
+            entry(from: row)
+        }
+    }
+
+    func removeOutbox(id: UUID) {
+        run("DELETE FROM outbox WHERE id = ?;", bind: [id.uuidString])
+    }
+
+    func recordOutboxAttempt(id: UUID) {
+        run("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?;", bind: [id.uuidString])
+    }
+
+    private func entry(from row: Row) -> OutboxEntry? {
+        guard let id = row.text(0).flatMap(UUID.init(uuidString:)),
+              let emailID = row.text(1),
+              let json = row.text(2),
+              let action = decode(OutboxEntry.Action.self, from: json) else {
+            return nil
+        }
+
+        return OutboxEntry(
+            id: id,
+            emailID: emailID,
+            action: action,
+            attempts: row.int(3),
+            queuedAt: Date(timeIntervalSinceReferenceDate: row.double(4))
+        )
     }
 
     // MARK: - Bodies
@@ -512,6 +662,10 @@ final class MailCache: @unchecked Sendable {
 
         func int(_ column: Int32) -> Int {
             Int(sqlite3_column_int64(statement, column))
+        }
+
+        func double(_ column: Int32) -> Double {
+            sqlite3_column_double(statement, column)
         }
     }
 

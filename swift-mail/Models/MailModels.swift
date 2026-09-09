@@ -341,6 +341,25 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Codable {
         return now.timeIntervalSince(receivedAt) <= maxAge
     }
 
+    /// A move, as JMAP models it: `mailboxIds` is replaced outright rather than
+    /// added to, so the message leaves every folder it was in.
+    func settingMailbox(_ mailboxID: String) -> EmailPreview {
+        EmailPreview(
+            id: id,
+            threadId: threadId,
+            mailboxIds: [mailboxID: true],
+            from: from,
+            to: to,
+            cc: cc,
+            subject: subject,
+            receivedAt: receivedAt,
+            preview: preview,
+            keywords: keywords,
+            hasAttachment: hasAttachment,
+            deliveredTo: deliveredTo
+        )
+    }
+
     func settingSeen(_ isSeen: Bool) -> EmailPreview {
         settingKeyword("$seen", isSeen)
     }
