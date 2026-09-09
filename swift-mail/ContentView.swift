@@ -19,7 +19,9 @@ struct ContentView: View {
             }
         }
         .task {
-            if store.hasConfiguredAccount && store.mailboxes.isEmpty {
+            // Not "are there mailboxes": a restored snapshot fills those before
+            // the first request, and the app would then never connect.
+            if store.hasConfiguredAccount && store.needsInitialRefresh {
                 await store.refresh()
             }
         }

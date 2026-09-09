@@ -216,7 +216,7 @@ private extension CharacterSet {
     static let jmapTemplateValue = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 }
 
-nonisolated struct Mailbox: Identifiable, Hashable, Decodable {
+nonisolated struct Mailbox: Identifiable, Hashable, Codable {
     let id: String
     let name: String
     let role: String?
@@ -281,7 +281,7 @@ nonisolated struct EmailAddress: Hashable, Codable {
     }
 }
 
-nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
+nonisolated struct EmailPreview: Identifiable, Hashable, Codable {
     let id: String
     let threadId: String?
     let mailboxIds: [String: Bool]?
