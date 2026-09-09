@@ -38,10 +38,10 @@ nonisolated struct MailTag: Identifiable, Hashable, Codable {
         return addresses.contains { Self.pattern($0, matches: wanted) }
     }
 
-    /// Whether this message is this tag's mail — addressed to one of its
-    /// aliases, or sent from one. The sender half is what makes Sent and
-    /// Drafts sort correctly, where your own address is in `from` and the
-    /// recipients are everyone else's.
+    /// Whether this message is this tag's mail — delivered to one of its
+    /// aliases, addressed to one, or sent from one. The sender half is what
+    /// makes Sent and Drafts sort correctly, where your own address is in
+    /// `from` and the recipients are everyone else's.
     func matches(_ email: EmailPreview) -> Bool {
         Self.correspondents(of: email).contains { contains(address: $0) }
     }
@@ -59,17 +59,23 @@ nonisolated struct MailTag: Identifiable, Hashable, Codable {
 
         // RFC 8621 §4.4.1 makes `from`/`to`/`cc` substring matches over the
         // header, which is why a wildcard alias can search for its domain and
-        // an ordinary one for the whole address.
-        let conditions = values.sorted().flatMap {
-            [["from": $0], ["to": $0], ["cc": $0]]
+        // an ordinary one for the whole address. `header` is the same section's
+        // name/substring pair, and is what keeps relayed mail in the narrowed
+        // folder rather than only labelling it in the unified one.
+        let conditions: [[String: Any]] = values.sorted().flatMap {
+            [["from": $0], ["to": $0], ["cc": $0], ["header": ["X-Delivered-To", $0]]]
         }
 
         return ["operator": "OR", "conditions": conditions]
     }
 
     /// Every address on a message that could identify it as one tag's mail.
+    ///
+    /// `deliveredTo` leads because it is the only one a relay can't hide: mail
+    /// through Hide My Email or a forwarding iCloud address carries the
+    /// relay's address in `to` and yours only here.
     static func correspondents(of email: EmailPreview) -> [String] {
-        ((email.from ?? []) + (email.to ?? []) + (email.cc ?? [])).map(\.email)
+        ((email.deliveredTo ?? []) + (email.from ?? []) + (email.to ?? []) + (email.cc ?? [])).map(\.email)
     }
 
     /// `*@example.com` and `@example.com` both mean every address at that

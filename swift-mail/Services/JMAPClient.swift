@@ -171,7 +171,10 @@ final class JMAPClient {
         "receivedAt",
         "preview",
         "keywords",
-        "hasAttachment"
+        "hasAttachment",
+        // Which of the account's addresses the message was delivered to, which
+        // `to`/`cc` can't answer for anything that arrived via a relay.
+        "header:X-Delivered-To:asAddresses"
     ]
 
     func fetchEmailPreviews(

@@ -293,6 +293,21 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
     let preview: String?
     let keywords: [String: Bool]?
     let hasAttachment: Bool?
+    /// The envelope recipient Fastmail stamps on delivery (`X-Delivered-To`):
+    /// the address the message was actually sent to *here*.
+    ///
+    /// For anything relayed — Apple's Hide My Email, an iCloud address
+    /// forwarding in, a forward from another provider — the visible `To` is
+    /// the relay's own address and names none of your aliases. This header is
+    /// the only place the message says which of your addresses it arrived at.
+    let deliveredTo: [EmailAddress]?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, threadId, mailboxIds, from, to, cc, subject, receivedAt, preview, keywords, hasAttachment
+        // RFC 8621 §4.1.2's header form: the server parses the field for us
+        // rather than us reading raw text and guessing at its shape.
+        case deliveredTo = "header:X-Delivered-To:asAddresses"
+    }
 
     var senderLine: String {
         from?.first?.name?.nilIfEmpty ?? from?.first?.email ?? "Unknown Sender"
@@ -353,7 +368,8 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
             receivedAt: receivedAt,
             preview: preview,
             keywords: keywords,
-            hasAttachment: hasAttachment
+            hasAttachment: hasAttachment,
+            deliveredTo: deliveredTo
         )
     }
 }

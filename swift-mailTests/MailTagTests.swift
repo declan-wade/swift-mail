@@ -15,7 +15,12 @@ struct MailTagTests {
     private let work = MailTag(name: "Work", color: .blue, addresses: ["declan@example.com"])
     private let wildcard = MailTag(name: "Domain", color: .green, addresses: ["*@example.com"])
 
-    private func preview(from: String = "stranger@elsewhere.test", to: [String] = [], cc: [String] = []) throws -> EmailPreview {
+    private func preview(
+        from: String = "stranger@elsewhere.test",
+        to: [String] = [],
+        cc: [String] = [],
+        deliveredTo: [String] = []
+    ) throws -> EmailPreview {
         func addresses(_ list: [String]) -> String {
             list.map { #"{ "email": "\#($0)" }"# }.joined(separator: ",")
         }
@@ -25,7 +30,8 @@ struct MailTagTests {
             "id": "E1",
             "from": [\(addresses([from]))],
             "to": [\(addresses(to))],
-            "cc": [\(addresses(cc))]
+            "cc": [\(addresses(cc))],
+            "header:X-Delivered-To:asAddresses": [\(addresses(deliveredTo))]
         }
         """.utf8))
     }
@@ -38,6 +44,33 @@ struct MailTagTests {
         #expect(work.matches(try preview(from: "declan@example.com", to: ["someone@elsewhere.test"])))
         // Case is the server's to choose, not a reason to miss a match.
         #expect(work.matches(try preview(to: ["Declan@Example.COM"])))
+    }
+
+    @Test("Relayed mail is claimed by the address it was delivered to")
+    func matchesRelayedMailByDeliveryHeader() throws {
+        // Hide My Email: the visible recipient is Apple's relay, and the only
+        // mention of the user's own alias is the delivery header Fastmail
+        // stamps on the way in.
+        let relayed = try preview(
+            from: "shop@store.test",
+            to: ["a1b2c3@privaterelay.appleid.com"],
+            deliveredTo: ["declan@example.com"]
+        )
+
+        #expect(work.matches(relayed))
+        // The relay's own address still belongs to nobody.
+        #expect(!MailTag(name: "Other", color: .pink, addresses: ["someone@example.org"]).matches(relayed))
+    }
+
+    @Test("The server query looks in the delivery header too")
+    func queryIncludesDeliveryHeader() throws {
+        let condition = try #require(work.jmapCondition)
+        let conditions = try #require(condition["conditions"] as? [[String: Any]])
+        let header = try #require(conditions.compactMap { $0["header"] as? [String] }.first)
+
+        // Narrowing to a tag has to find the same relayed mail the label does,
+        // or a message reads "Work" in the unified list and vanishes in Work.
+        #expect(header == ["X-Delivered-To", "declan@example.com"])
     }
 
     @Test("A tag claims nothing that isn't its alias")
@@ -81,7 +114,7 @@ struct MailTagTests {
         #expect(condition["operator"] as? String == "OR")
         // Every header a correspondent can appear in, or the narrowed Sent
         // folder comes back empty.
-        #expect(Set(conditions.flatMap(\.keys)) == ["from", "to", "cc"])
+        #expect(Set(conditions.flatMap(\.keys)) == ["from", "to", "cc", "header"])
         #expect(Set(conditions.compactMap { $0.values.first as? String }) == ["@example.com"])
     }
 
