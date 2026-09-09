@@ -287,6 +287,7 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
     let mailboxIds: [String: Bool]?
     let from: [EmailAddress]?
     let to: [EmailAddress]?
+    let cc: [EmailAddress]?
     let subject: String?
     let receivedAt: Date?
     let preview: String?
@@ -347,6 +348,7 @@ nonisolated struct EmailPreview: Identifiable, Hashable, Decodable {
             mailboxIds: mailboxIds,
             from: from,
             to: to,
+            cc: cc,
             subject: subject,
             receivedAt: receivedAt,
             preview: preview,

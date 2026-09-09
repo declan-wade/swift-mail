@@ -166,6 +166,7 @@ final class JMAPClient {
         "mailboxIds",
         "from",
         "to",
+        "cc",
         "subject",
         "receivedAt",
         "preview",

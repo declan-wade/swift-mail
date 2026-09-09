@@ -12,6 +12,10 @@ struct SettingsView: View {
                 GeneralSettings()
             }
 
+            Tab("Tags", systemImage: "tag") {
+                TagSettings(store: store)
+            }
+
             Tab("Notifications", systemImage: "bell") {
                 NotificationSettings(store: store)
             }
@@ -77,6 +81,110 @@ private struct GeneralSettings: View {
     private var swipeOptions: some View {
         ForEach(SwipeAction.allCases) { action in
             Text(action.settingsLabel).tag(action.rawValue)
+        }
+    }
+}
+
+// MARK: - Tags
+
+/// Which alias belongs to which tag.
+///
+/// An address belongs to one tag at a time, so this asks the question once per
+/// alias — "what kind of mail is this address for" — instead of offering a
+/// checklist per tag that could contradict itself.
+private struct TagSettings: View {
+    @ObservedObject var store: MailStore
+
+    var body: some View {
+        Form {
+            Section {
+                if store.tags.isEmpty {
+                    Text("No tags yet. Messages carry no labels and every folder shows all of your mail.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach($store.tags) { $tag in
+                        TagRow(tag: $tag) { store.removeTag(id: tag.id) }
+                    }
+                }
+
+                Button("Add Tag", systemImage: "plus") {
+                    store.addTag()
+                }
+            } header: {
+                Text("Tags")
+            } footer: {
+                Text("A tag colours its mail in the message list. Pick one in the sidebar to narrow every folder to just that tag's mail.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                if store.identities.isEmpty {
+                    Text("Connect an account to see your aliases.")
+                        .foregroundStyle(.secondary)
+                } else if store.tags.isEmpty {
+                    Text("Add a tag first, then assign your aliases to it.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(store.identities) { identity in
+                        Picker(identity.email, selection: tagBinding(for: identity)) {
+                            Text("None").tag(MailTag.ID?.none)
+
+                            ForEach(store.tags) { tag in
+                                Text(tag.displayName).tag(MailTag.ID?.some(tag.id))
+                            }
+                        }
+                    }
+                }
+            } header: {
+                Text("Aliases")
+            } footer: {
+                Text("A message takes the tag of the address it was sent to, or sent from — so Sent and Drafts sort the same way the Inbox does. A wildcard alias like *@example.com covers every address on that domain.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .settingsPane(height: 520)
+    }
+
+    private func tagBinding(for identity: MailIdentity) -> Binding<MailTag.ID?> {
+        Binding(
+            get: { store.tags.first { $0.contains(address: identity.email) }?.id },
+            set: { store.assignAddress(identity.email, toTagID: $0) }
+        )
+    }
+}
+
+/// One tag: its colour, its name, and the way to remove it. Removing a tag
+/// also releases the aliases assigned to it, because the assignment is stored
+/// on the tag itself rather than beside it.
+private struct TagRow: View {
+    @Binding var tag: MailTag
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            Circle()
+                .fill(tag.color.color)
+                .frame(width: Theme.Size.unreadDot + 2, height: Theme.Size.unreadDot + 2)
+
+            TextField("Name", text: $tag.name)
+                .textFieldStyle(.roundedBorder)
+
+            Picker("Colour", selection: $tag.color) {
+                ForEach(TagColor.allCases) { color in
+                    Text(color.label).tag(color)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+
+            Button(role: .destructive, action: onRemove) {
+                Image(systemName: "minus.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Remove Tag")
         }
     }
 }

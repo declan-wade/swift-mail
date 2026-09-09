@@ -143,7 +143,19 @@ struct EmailListView: View {
     @ViewBuilder
     private var emptyState: some View {
         if store.searchText.trimmingCharacters(in: .whitespaces).isEmpty {
-            ContentUnavailableView("No Messages", systemImage: "tray")
+            if let tag = store.activeTag {
+                // An empty folder that is only empty because of the tag has to
+                // say so and offer the way out, or it reads as lost mail.
+                ContentUnavailableView {
+                    Label("No \(tag.displayName) Mail", systemImage: "tray")
+                } description: {
+                    Text("Nothing in this folder was sent to or from \(tag.displayName)'s aliases.")
+                } actions: {
+                    Button("Show All Mail") { store.activeTagID = nil }
+                }
+            } else {
+                ContentUnavailableView("No Messages", systemImage: "tray")
+            }
         } else if store.isFilteredWithoutSearchTerms {
             // Quoting `is:unread` back at the user isn't an empty state.
             ContentUnavailableView(
@@ -240,6 +252,16 @@ private struct EmailRow: View {
 
                     Spacer(minLength: Theme.Spacing.sm)
 
+                    if let tag {
+                        Text(tag.displayName)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(tag.color.color)
+                            .lineLimit(1)
+                            // The sender is the longer, more repetitive half of
+                            // this row: it truncates before the label does.
+                            .layoutPriority(1)
+                    }
+
                     if isHovering {
                         quickActions
                     } else if let receivedAt = email.receivedAt {
@@ -287,6 +309,17 @@ private struct EmailRow: View {
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
             swipeButton(for: SwipeAction(rawValue: trailing) ?? SwipePreferences.trailingDefault)
         }
+    }
+
+    /// The tag this message belongs to, or nil when there is nothing to say.
+    /// Hidden while the window is narrowed to one tag, where every row would
+    /// otherwise carry the same label.
+    private var tag: MailTag? {
+        guard store.activeTagID == nil else {
+            return nil
+        }
+
+        return store.tags.tag(for: email)
     }
 
     @ViewBuilder

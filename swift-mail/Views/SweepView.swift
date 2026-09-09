@@ -49,8 +49,21 @@ struct SweepView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            Text("Sweep \(store.selectedMailbox?.displayName ?? "Mailbox")")
-                .font(.headline)
+            HStack(spacing: Theme.Spacing.sm) {
+                Text("Sweep \(store.selectedMailbox?.displayName ?? "Mailbox")")
+                    .font(.headline)
+
+                // A sweep inherits whichever tag the window is narrowed to,
+                // and a bulk move is the last place to leave that implicit.
+                if let tag = store.activeTag {
+                    Text("\(tag.displayName) only")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(tag.color.color)
+                        .padding(.horizontal, Theme.Spacing.sm)
+                        .padding(.vertical, 2)
+                        .background(tag.color.color.opacity(0.18), in: Capsule())
+                }
+            }
 
             // The prompt stays instructional. An example here reads as a value
             // already typed in, which is exactly the wrong impression on a

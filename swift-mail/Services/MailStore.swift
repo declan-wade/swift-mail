@@ -61,6 +61,46 @@ final class MailStore: ObservableObject {
     @Published var updatingFlagEmailIDs: Set<EmailPreview.ID> = []
     @Published var movingEmailIDs: Set<EmailPreview.ID> = []
     @Published var identities: [MailIdentity] = []
+    /// The colour-coded tags the account's aliases are grouped into. Empty is
+    /// the default, and an empty list means the app behaves exactly as it did
+    /// before tags existed — no chips, no labels, no narrowing.
+    @Published var tags: [MailTag] = [] {
+        didSet {
+            guard tags != oldValue else {
+                return
+            }
+
+            TagPreferences.save(tags)
+
+            // Deleting the tag the window was narrowed to has to lift the
+            // narrowing too, or the list stays filtered by something the user
+            // can no longer see or switch off.
+            if let activeTagID, !tags.contains(where: { $0.id == activeTagID }) {
+                self.activeTagID = nil
+                return
+            }
+
+            // Only an alias change alters which messages the active tag
+            // matches; a rename or a recolour repaints the rows already on
+            // screen without going back to the server.
+            if addresses(ofTagID: activeTagID, in: tags) != addresses(ofTagID: activeTagID, in: oldValue) {
+                reloadForTagChange()
+            }
+        }
+    }
+
+    /// The tag every folder is currently narrowed to — the separated inbox —
+    /// or nil for the unified view every untagged account gets.
+    @Published var activeTagID: MailTag.ID? {
+        didSet {
+            guard activeTagID != oldValue else {
+                return
+            }
+
+            TagPreferences.saveActiveID(activeTagID)
+            reloadForTagChange()
+        }
+    }
     /// Modal-alert error for discrete, user-initiated actions (send, flag,
     /// archive, manual refresh). Background and column-scoped failures use the
     /// dedicated properties below so they don't interrupt the user.
@@ -121,6 +161,20 @@ final class MailStore: ObservableObject {
         }
 
         return SearchQuery(activeSearch).jmapFilter(mailboxID: mailboxID, mailboxes: mailboxes)
+    }
+
+    /// The filter behind the message list: the search query, narrowed again to
+    /// the active tag's aliases. `fetchEmailPreviews` reads a nil filter as
+    /// "this mailbox", so the mailbox condition is spelled out here the moment
+    /// a tag has to be ANDed alongside it.
+    private func listFilter(mailboxID: Mailbox.ID) -> [String: Any]? {
+        let search = searchFilter(mailboxID: mailboxID)
+
+        guard let tagCondition = activeTag?.jmapCondition else {
+            return search
+        }
+
+        return ["operator": "AND", "conditions": [search ?? ["inMailbox": mailboxID], tagCondition]]
     }
 
     func isActive(_ filter: SearchQuery.QuickFilter) -> Bool {
@@ -214,8 +268,75 @@ final class MailStore: ObservableObject {
         mailboxes.first { $0.role == role }
     }
 
+    var activeTag: MailTag? {
+        tags.first { $0.id == activeTagID }
+    }
+
+    /// Whether a message belongs in the list as it is currently narrowed. A
+    /// tag with no aliases yet narrows nothing, matching the query the server
+    /// is actually being sent.
+    private func matchesActiveTag(_ email: EmailPreview) -> Bool {
+        guard let tag = activeTag, !tag.addresses.isEmpty else {
+            return true
+        }
+
+        return tag.matches(email)
+    }
+
+    private func addresses(ofTagID id: MailTag.ID?, in tags: [MailTag]) -> [String]? {
+        tags.first { $0.id == id }?.addresses
+    }
+
+    /// Adds a tag already named and coloured, so the common case is one click
+    /// and no decisions.
+    func addTag() {
+        tags.append(
+            MailTag(
+                name: MailTag.suggestedName(existing: tags),
+                color: MailTag.suggestedColor(existing: tags)
+            )
+        )
+    }
+
+    func removeTag(id: MailTag.ID) {
+        tags.removeAll { $0.id == id }
+    }
+
+    /// Moves one alias onto `tagID`, or off every tag when nil. An alias
+    /// belongs to at most one tag, so this rewrites the whole list in a single
+    /// assignment rather than removing here and adding there.
+    func assignAddress(_ address: String, toTagID tagID: MailTag.ID?) {
+        let address = address.lowercased()
+
+        tags = tags.map { tag in
+            var tag = tag
+            tag.addresses.removeAll { $0.caseInsensitiveCompare(address) == .orderedSame }
+
+            if tag.id == tagID {
+                tag.addresses.append(address)
+            }
+
+            return tag
+        }
+    }
+
+    private func reloadForTagChange() {
+        guard let mailboxID = selectedMailboxID else {
+            return
+        }
+
+        Task { await loadEmails(mailboxID: mailboxID) }
+    }
+
     init() {
         loadSavedAccount()
+
+        // Assignments in an initializer skip `didSet`, so restoring these
+        // neither re-saves them nor kicks off a load before there is an
+        // account to load from.
+        tags = TagPreferences.load()
+        let restored = TagPreferences.loadActiveID()
+        activeTagID = tags.contains { $0.id == restored } ? restored : nil
     }
 
     func saveAccount(displayName: String, sessionURL: URL, bearerToken: String) throws {
@@ -339,7 +460,7 @@ final class MailStore: ObservableObject {
                 mailboxID: mailboxID,
                 position: 0,
                 limit: emailPageSize,
-                searchFilter: searchFilter(mailboxID: mailboxID)
+                searchFilter: listFilter(mailboxID: mailboxID)
             )
 
             emails = page.previews
@@ -385,7 +506,7 @@ final class MailStore: ObservableObject {
                 mailboxID: mailboxID,
                 position: nextPosition,
                 limit: emailPageSize,
-                searchFilter: searchFilter(mailboxID: mailboxID)
+                searchFilter: listFilter(mailboxID: mailboxID)
             )
 
             // Guard against a mailbox/search switch that landed mid-request.
@@ -625,7 +746,18 @@ final class MailStore: ObservableObject {
     }
 
     private func sweepFilter(query: String) -> [String: Any]? {
-        Self.sweepFilter(query: query, mailboxID: selectedMailboxID, mailboxes: mailboxes)
+        guard let filter = Self.sweepFilter(query: query, mailboxID: selectedMailboxID, mailboxes: mailboxes) else {
+            return nil
+        }
+
+        // A sweep run while a tag is active stays inside that tag. What the
+        // user approved was a preview of the tag's mail, and a bulk move is
+        // the last place to quietly touch more than was shown.
+        guard let tagCondition = activeTag?.jmapCondition else {
+            return filter
+        }
+
+        return ["operator": "AND", "conditions": [filter, tagCondition]]
     }
 
     func previewSweep(query: String) async throws -> SweepPreview {
@@ -1279,7 +1411,12 @@ final class MailStore: ObservableObject {
         if let selectedMailboxID, activeSearch == nil {
             let known = Set(emails.map(\.id))
             let additions = previews
-                .filter { createdIDs.contains($0.id) && $0.mailboxIds?[selectedMailboxID] == true && !known.contains($0.id) }
+                .filter {
+                    createdIDs.contains($0.id)
+                        && $0.mailboxIds?[selectedMailboxID] == true
+                        && !known.contains($0.id)
+                        && matchesActiveTag($0)
+                }
                 .sorted { ($0.receivedAt ?? .distantPast) > ($1.receivedAt ?? .distantPast) }
             emails.insert(contentsOf: additions, at: 0)
         }
@@ -1318,7 +1455,8 @@ final class MailStore: ObservableObject {
                 session: session,
                 accountID: accountID,
                 mailboxID: mailboxID,
-                limit: max(emailPageSize, emails.count)
+                limit: max(emailPageSize, emails.count),
+                searchFilter: listFilter(mailboxID: mailboxID)
             )
 
             guard selectedMailboxID == mailboxID, activeSearch == nil else {
