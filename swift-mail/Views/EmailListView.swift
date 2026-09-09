@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct EmailListView: View {
@@ -278,13 +279,12 @@ private struct EmailRow: View {
                 isHovering = hovering
             }
         }
-        // Two-finger trackpad swipe. `allowsFullSwipe` is off: these are the
-        // same destructive actions the toolbar guards behind a deliberate
-        // click, and a full swipe fires them on momentum alone.
-        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+        // Two-finger trackpad swipe, same as Mail: swiping all the way
+        // across fires the action instead of just revealing the button.
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
             swipeButton(for: SwipeAction(rawValue: leading) ?? SwipePreferences.leadingDefault)
         }
-        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
             swipeButton(for: SwipeAction(rawValue: trailing) ?? SwipePreferences.trailingDefault)
         }
     }
@@ -293,6 +293,7 @@ private struct EmailRow: View {
     private func swipeButton(for action: SwipeAction) -> some View {
         if action != .none {
             Button(role: action == .delete ? .destructive : nil) {
+                NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
                 Task { await action.perform(on: email, in: store) }
             } label: {
                 Label(action.label(for: email), systemImage: action.icon(for: email))
