@@ -154,7 +154,16 @@ nonisolated struct SearchQuery {
         case .has:
             return attachmentValues.contains(term.value.lowercased()) ? ["hasAttachment": true] : nil
         case .is:
-            guard let flag = keywords[term.value.lowercased()] else {
+            let value = term.value.lowercased()
+
+            // Thread-level first: `is:muted` asks about the conversation, not
+            // the one message, and RFC 8621 4.4.1 has separate conditions for
+            // that question.
+            if let thread = threadKeywords[value] {
+                return [thread.condition: thread.keyword]
+            }
+
+            guard let flag = keywords[value] else {
                 return nil
             }
 
@@ -245,6 +254,21 @@ nonisolated struct SearchQuery {
         "replied": ("$answered", true),
         "forwarded": ("$forwarded", true)
     ]
+
+    /// `is:` values that ask about a whole conversation rather than one
+    /// message. `someInThreadHaveKeyword` finds the thread if any message
+    /// carries it; `noneInThreadHaveKeyword` is the exact complement, which is
+    /// what makes muting a thread stick even after part of it is read or filed.
+    static let threadKeywords: [String: (keyword: String, condition: String)] = [
+        "muted": ("$muted", "someInThreadHaveKeyword"),
+        "unmuted": ("$muted", "noneInThreadHaveKeyword")
+    ]
+
+    /// Excludes muted conversations. The Inbox applies this to every listing;
+    /// searching `is:muted` is how they are found again.
+    static let notMutedCondition: [String: Any] = ["noneInThreadHaveKeyword": "$muted"]
+
+    static let mutedKeyword = "$muted"
 }
 
 // MARK: - Quick filters
@@ -389,7 +413,9 @@ extension SearchQuery {
     ) -> [(value: String, detail: String)] {
         switch field {
         case .is:
-            return keywords.keys.sorted().map { ($0, "") }
+            return (Array(keywords.keys) + Array(threadKeywords.keys)).sorted().map {
+                ($0, threadKeywords[$0] != nil ? "The whole conversation" : "")
+            }
         case .has:
             return [("attachment", "Messages with a file attached")]
         case .in:

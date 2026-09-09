@@ -173,38 +173,51 @@ struct EmailListView: View {
             ForEach(store.emails) { email in
                 EmailRow(email: email, store: store)
                     .tag(email.id)
-                    .contextMenu {
-                        Button(email.isUnread ? "Mark as Read" : "Mark as Unread") {
-                            Task {
-                                await store.toggleReadState(emailID: email.id)
-                            }
-                        }
+                    .contextMenu { menu(for: email) }
 
-                        Button(email.isFlagged ? "Unflag" : "Flag") {
-                            Task {
-                                await store.toggleFlag(emailID: email.id)
-                            }
-                        }
-
-                        Divider()
-
-                        Button("Archive") {
-                            Task {
-                                await store.archive(emailID: email.id)
-                            }
-                        }
-
-                        Button("Delete", role: .destructive) {
-                            Task {
-                                await store.delete(emailID: email.id)
-                            }
-                        }
-                    }
+                // The rest of an opened conversation, oldest first, indented
+                // under the row that stands for it. Each is a real message with
+                // its own selection tag, so opening one reads it as usual.
+                ForEach(store.expandedMessages(for: email)) { message in
+                    EmailRow(email: message, store: store, isThreadChild: true)
+                        .tag(message.id)
+                        .contextMenu { menu(for: message) }
+                }
             }
 
             if store.hasMoreEmails {
                 loadMoreRow
             }
+        }
+    }
+
+    @ViewBuilder
+    private func menu(for email: EmailPreview) -> some View {
+        Button(email.isUnread ? "Mark as Read" : "Mark as Unread") {
+            Task { await store.toggleReadState(emailID: email.id) }
+        }
+
+        Button(email.isFlagged ? "Unflag" : "Flag") {
+            Task { await store.toggleFlag(emailID: email.id) }
+        }
+
+        if store.groupsIntoThreads, email.threadId != nil {
+            Divider()
+
+            Button(store.isMuted(email) ? "Unmute Conversation" : "Mute Conversation") {
+                Task { await store.toggleMute(for: email) }
+            }
+            .disabled(store.isMuting(email))
+        }
+
+        Divider()
+
+        Button("Archive") {
+            Task { await store.archive(emailID: email.id) }
+        }
+
+        Button("Delete", role: .destructive) {
+            Task { await store.delete(emailID: email.id) }
         }
     }
 
@@ -226,6 +239,9 @@ struct EmailListView: View {
 private struct EmailRow: View {
     let email: EmailPreview
     @ObservedObject var store: MailStore
+    /// A message shown *inside* an opened conversation, rather than the row
+    /// standing for the conversation itself.
+    var isThreadChild = false
     @State private var isHovering = false
     @AppStorage(SwipePreferences.leadingKey) private var leading = SwipePreferences.leadingDefault.rawValue
     @AppStorage(SwipePreferences.trailingKey) private var trailing = SwipePreferences.trailingDefault.rawValue
@@ -238,11 +254,32 @@ private struct EmailRow: View {
                 .padding(.top, 5)
                 .accessibilityLabel(email.isUnread ? "Unread" : "Read")
 
+            if isExpandable {
+                disclosure
+            }
+
             VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
                 HStack(spacing: Theme.Spacing.sm) {
                     Text(email.senderLine)
                         .fontWeight(email.isUnread ? .semibold : .regular)
                         .lineLimit(1)
+
+                    if isExpandable {
+                        Text(store.threadCount(for: email).formatted())
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(.quaternary, in: Capsule())
+                            .accessibilityLabel("\(store.threadCount(for: email)) messages")
+                    }
+
+                    if store.isMuted(email) {
+                        Image(systemName: "bell.slash")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Muted")
+                    }
 
                     if email.isFlagged {
                         Image(systemName: "flag.fill")
@@ -295,6 +332,10 @@ private struct EmailRow: View {
             }
         }
         .padding(.vertical, Theme.Spacing.sm - 2)
+        // Children sit under the row they belong to. The inset matches the
+        // unread dot plus the chevron, so a child's text lines up with its
+        // parent's rather than with the column edge.
+        .padding(.leading, isThreadChild ? Theme.Spacing.lg : 0)
         .contentShape(Rectangle())
         .onHover { hovering in
             withAnimation(Theme.Motion.hover) {
@@ -309,6 +350,32 @@ private struct EmailRow: View {
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
             swipeButton(for: SwipeAction(rawValue: trailing) ?? SwipePreferences.trailingDefault)
         }
+    }
+
+    /// Only the row standing for a conversation opens it; a message already
+    /// inside one has nothing left to reveal.
+    private var isExpandable: Bool {
+        !isThreadChild && store.isExpandable(email)
+    }
+
+    private var disclosure: some View {
+        Button {
+            Task { await store.toggleExpansion(of: email) }
+        } label: {
+            if store.isLoadingThread(email) {
+                ProgressView()
+                    .controlSize(.mini)
+            } else {
+                Image(systemName: "chevron.right")
+                    .rotationEffect(.degrees(store.isExpanded(email) ? 90 : 0))
+            }
+        }
+        .buttonStyle(.plain)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .frame(width: 12)
+        .padding(.top, 2)
+        .accessibilityLabel(store.isExpanded(email) ? "Collapse conversation" : "Expand conversation")
     }
 
     /// The tag this message belongs to, or nil when there is nothing to say.

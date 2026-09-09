@@ -69,6 +69,11 @@ final class JMAPClient {
         /// The `Email` type state this page was fetched at, so an incremental
         /// sync can start from a known point rather than re-querying.
         let state: String?
+        /// Thread id to every message in it, for the pages fetched with
+        /// `collapseThreads`. Empty otherwise. This is what tells a collapsed
+        /// row how many messages it stands for, and which to fetch when it is
+        /// opened.
+        let threadEmailIDs: [String: [String]]
     }
 
     /// The current server-side state string for each object type, used as the
@@ -177,47 +182,78 @@ final class JMAPClient {
         "header:X-Delivered-To:asAddresses"
     ]
 
+    /// - Parameter collapseThreads: when true the query returns one message per
+    ///   conversation — the newest that matches — and `Thread/get` comes back
+    ///   in the same request with the full membership of each.
+    /// - Parameter anchor: page from this message's place in the results
+    ///   instead of from a numeric offset. An index moves whenever mail arrives
+    ///   above it; an id doesn't. Throws `anchorNotFound` if the message is no
+    ///   longer in the result set, which the caller answers by falling back to
+    ///   `position`.
+    /// - Parameter anchorOffset: added to the anchor's index. `1` means "the
+    ///   page that starts just after this message".
     func fetchEmailPreviews(
         session: JMAPSession,
         accountID: String,
         mailboxID: String,
         position: Int = 0,
+        anchor: String? = nil,
+        anchorOffset: Int = 0,
         limit: Int = 50,
-        searchFilter: [String: Any]? = nil
+        searchFilter: [String: Any]? = nil,
+        collapseThreads: Bool = false
     ) async throws -> EmailPreviewPage {
         let properties = Self.previewProperties
         let filter = searchFilter ?? ["inMailbox": mailboxID]
 
-        let response = try await call(
-            apiURL: session.apiURL,
-            methodCalls: [
+        var methodCalls: [[Any]] = [
+            [
+                "Email/query",
+                Self.queryArguments(
+                    accountID: accountID,
+                    filter: filter,
+                    position: position,
+                    anchor: anchor,
+                    anchorOffset: anchorOffset,
+                    limit: limit,
+                    collapseThreads: collapseThreads
+                ),
+                "query"
+            ],
+            [
+                "Email/get",
                 [
-                    "Email/query",
-                    [
-                        "accountId": accountID,
-                        "filter": filter,
-                        "sort": [["property": "receivedAt", "isAscending": false]],
-                        "position": position,
-                        "limit": limit,
-                        "calculateTotal": true
+                    "accountId": accountID,
+                    "#ids": [
+                        "resultOf": "query",
+                        "name": "Email/query",
+                        "path": "/ids"
                     ],
-                    "query"
+                    "properties": properties
                 ],
-                [
-                    "Email/get",
-                    [
-                        "accountId": accountID,
-                        "#ids": [
-                            "resultOf": "query",
-                            "name": "Email/query",
-                            "path": "/ids"
-                        ],
-                        "properties": properties
-                    ],
-                    "emails"
-                ]
+                "emails"
             ]
-        )
+        ]
+
+        if collapseThreads {
+            // The thread ids aren't known until `Email/get` answers, so this
+            // back-references its result rather than the query's: `/list/*/…`
+            // is RFC 8620 3.7's wildcard for "that property of every item".
+            methodCalls.append([
+                "Thread/get",
+                [
+                    "accountId": accountID,
+                    "#ids": [
+                        "resultOf": "emails",
+                        "name": "Email/get",
+                        "path": "/list/*/threadId"
+                    ]
+                ],
+                "threads"
+            ])
+        }
+
+        let response = try await call(apiURL: session.apiURL, methodCalls: methodCalls)
 
         let queryPayload = try response.payload(named: "Email/query", clientID: "query")
         let orderedIDs = (queryPayload["ids"] as? [String]) ?? []
@@ -235,8 +271,63 @@ final class JMAPClient {
             previews: ordered.isEmpty ? previews : ordered,
             position: queryPosition,
             total: total,
-            state: payload["state"] as? String
+            state: payload["state"] as? String,
+            // `try?`: the counts are what let a row be opened, not what lets
+            // the mailbox be read. A server that refuses `Thread/get` — or the
+            // `/list/*/threadId` back-reference — degrades to a flat-looking
+            // list rather than a folder that won't load at all.
+            threadEmailIDs: collapseThreads
+                ? (try? response.payload(named: "Thread/get", clientID: "threads"))
+                    .map(Self.threadMembership) ?? [:]
+                : [:]
         )
+    }
+
+    /// The `Email/query` arguments for one page.
+    static func queryArguments(
+        accountID: String,
+        filter: [String: Any],
+        position: Int,
+        anchor: String?,
+        anchorOffset: Int,
+        limit: Int,
+        collapseThreads: Bool
+    ) -> [String: Any] {
+        var arguments: [String: Any] = [
+            "accountId": accountID,
+            "filter": filter,
+            "sort": [["property": "receivedAt", "isAscending": false]],
+            "limit": limit,
+            "calculateTotal": true,
+            "collapseThreads": collapseThreads
+        ]
+
+        // RFC 8620 5.5: `position` is ignored when an anchor is given, so only
+        // one of the two is ever sent rather than leaving a stale offset in the
+        // request for a server to interpret.
+        if let anchor {
+            arguments["anchor"] = anchor
+            arguments["anchorOffset"] = anchorOffset
+        } else {
+            arguments["position"] = position
+        }
+
+        return arguments
+    }
+
+    /// `Thread/get`'s list as a lookup from thread id to its messages.
+    static func threadMembership(in payload: [String: Any]) -> [String: [String]] {
+        guard let list = payload["list"] as? [[String: Any]] else {
+            return [:]
+        }
+
+        return list.reduce(into: [:]) { result, thread in
+            guard let id = thread["id"] as? String else {
+                return
+            }
+
+            result[id] = thread["emailIds"] as? [String] ?? []
+        }
     }
 
     /// Ids only, no `Email/get`. Sweep needs the whole matching set before it
@@ -428,6 +519,39 @@ final class JMAPClient {
         if let notUpdated = payload["notUpdated"] as? [String: Any], !notUpdated.isEmpty {
             throw JMAPError.methodError("emailNotUpdated")
         }
+    }
+
+    /// Sets or clears one keyword across every message in a thread.
+    ///
+    /// `noneInThreadHaveKeyword` only needs one message to carry `$muted` for
+    /// the whole thread to be excluded, but marking one and then deleting it
+    /// would quietly unmute the thread — so every message gets it.
+    func setThreadKeyword(
+        session: JMAPSession,
+        accountID: String,
+        emailIDs: [String],
+        keyword: String,
+        isSet: Bool
+    ) async throws {
+        guard !emailIDs.isEmpty else {
+            return
+        }
+
+        let patchValue: Any = isSet ? true : NSNull()
+        let update = Dictionary(
+            emailIDs.map { ($0, ["keywords/\(keyword)": patchValue]) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                ["Email/set", ["accountId": accountID, "update": update], "setThreadKeyword"]
+            ]
+        )
+
+        let payload = try response.payload(named: "Email/set", clientID: "setThreadKeyword")
+        try Self.throwIfRejected(payload, key: "notUpdated")
     }
 
     /// Moves an email to a single destination mailbox, replacing its

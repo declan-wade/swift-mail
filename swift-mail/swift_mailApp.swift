@@ -24,6 +24,7 @@ struct swift_mailApp: App {
         }
         .commands {
             ComposeCommands(store: store)
+            ViewCommands(store: store)
         }
 
         WindowGroup(id: ComposeWindow.id, for: ComposeDraft.self) { $draft in
@@ -70,6 +71,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Quit Anyway")
 
         return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow
+    }
+}
+
+/// Grouping belongs in the View menu, where macOS mail clients have always put
+/// it, rather than in Settings — it is a way of looking at the list, changed
+/// often, not a preference set once.
+private struct ViewCommands: Commands {
+    @ObservedObject var store: MailStore
+
+    var body: some Commands {
+        CommandGroup(after: .toolbar) {
+            Toggle("Organize by Conversation", isOn: Binding(
+                get: { store.groupsIntoThreads },
+                set: { store.groupsIntoThreads = $0 }
+            ))
+            .keyboardShortcut("t", modifiers: [.command, .control])
+        }
     }
 }
 

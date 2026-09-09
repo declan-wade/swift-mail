@@ -45,6 +45,21 @@ nonisolated enum ReadingPreferences {
     }
 }
 
+/// Whether the message list is one row per conversation or one per message.
+nonisolated enum ThreadPreferences {
+    /// Stored inverted: `UserDefaults` answers a missing bool with `false`, and
+    /// grouped is the default worth having, so the stored flag is the opt-out.
+    static let ungroupedKey = "swift-mail.list.ungrouped"
+
+    static var groupsIntoThreads: Bool {
+        !UserDefaults.standard.bool(forKey: ungroupedKey)
+    }
+
+    static func setGroupsIntoThreads(_ isGrouped: Bool, in defaults: UserDefaults = .standard) {
+        defaults.set(!isGrouped, forKey: ungroupedKey)
+    }
+}
+
 /// How long the server holds a message before releasing it.
 ///
 /// Send later and undo send are the same mechanism — an `EmailSubmission` with
@@ -276,6 +291,33 @@ final class MailStore: ObservableObject {
     /// the app is holding work for a connection it doesn't have.
     @Published private(set) var pendingOutboxCount = 0
 
+    /// Thread id to every message in it, for the conversations on screen.
+    /// Populated by `Thread/get` alongside each collapsed page.
+    @Published private(set) var threadEmailIDs: [String: [String]] = [:]
+    /// Conversations the user has opened out in the list.
+    @Published private(set) var expandedThreadIDs: Set<String> = []
+    /// The messages of an opened conversation, oldest first.
+    @Published private(set) var threadMessages: [String: [EmailPreview]] = [:]
+    @Published private(set) var loadingThreadIDs: Set<String> = []
+    @Published private(set) var mutingThreadIDs: Set<String> = []
+
+    @Published var groupsIntoThreads = ThreadPreferences.groupsIntoThreads {
+        didSet {
+            guard groupsIntoThreads != oldValue else {
+                return
+            }
+
+            ThreadPreferences.setGroupsIntoThreads(groupsIntoThreads)
+            collapseAllThreads()
+
+            // The two modes return different rows for the same folder, so the
+            // list has to be re-queried rather than regrouped in place.
+            if let selectedMailboxID {
+                Task { await loadEmails(mailboxID: selectedMailboxID) }
+            }
+        }
+    }
+
     /// The send currently offered for undo, if any.
     @Published private(set) var pendingSend: PendingSend?
     private var undoWindowTask: Task<Void, Never>?
@@ -336,12 +378,30 @@ final class MailStore: ObservableObject {
     /// a tag has to be ANDed alongside it.
     private func listFilter(mailboxID: Mailbox.ID) -> [String: Any]? {
         let search = searchFilter(mailboxID: mailboxID)
+        var extras: [[String: Any]] = []
 
-        guard let tagCondition = activeTag?.jmapCondition else {
+        if let tagCondition = activeTag?.jmapCondition {
+            extras.append(tagCondition)
+        }
+
+        if excludesMutedThreads(mailboxID: mailboxID) {
+            extras.append(SearchQuery.notMutedCondition)
+        }
+
+        guard !extras.isEmpty else {
             return search
         }
 
-        return ["operator": "AND", "conditions": [search ?? ["inMailbox": mailboxID], tagCondition]]
+        return ["operator": "AND", "conditions": [search ?? ["inMailbox": mailboxID]] + extras]
+    }
+
+    /// Muting is about the Inbox specifically — "stop bringing this to me" —
+    /// so a muted conversation is still there in Archive and in search, where
+    /// hiding it would read as lost mail. An explicit `is:muted` also opts back
+    /// in, so the exclusion never fights the query the user typed.
+    private func excludesMutedThreads(mailboxID: Mailbox.ID) -> Bool {
+        mailbox(role: "inbox")?.id == mailboxID
+            && !SearchQuery.contains("is:muted", in: searchText)
     }
 
     func isActive(_ filter: SearchQuery.QuickFilter) -> Bool {
@@ -514,6 +574,150 @@ final class MailStore: ObservableObject {
             }
 
             return tag
+        }
+    }
+
+    // MARK: - Conversations
+
+    /// How many messages the conversation this row stands for holds. `1` when
+    /// the list isn't grouped, or before `Thread/get` has answered.
+    func threadCount(for email: EmailPreview) -> Int {
+        guard groupsIntoThreads, let threadID = email.threadId else {
+            return 1
+        }
+
+        return max(1, threadEmailIDs[threadID]?.count ?? 1)
+    }
+
+    func isExpandable(_ email: EmailPreview) -> Bool {
+        threadCount(for: email) > 1
+    }
+
+    func isExpanded(_ email: EmailPreview) -> Bool {
+        email.threadId.map(expandedThreadIDs.contains) ?? false
+    }
+
+    func isLoadingThread(_ email: EmailPreview) -> Bool {
+        email.threadId.map(loadingThreadIDs.contains) ?? false
+    }
+
+    func isMuting(_ email: EmailPreview) -> Bool {
+        email.threadId.map(mutingThreadIDs.contains) ?? false
+    }
+
+    func isMuted(_ email: EmailPreview) -> Bool {
+        guard let threadID = email.threadId else {
+            return email.keywords?[SearchQuery.mutedKeyword] == true
+        }
+
+        // The representative is the only message the list holds for a collapsed
+        // conversation, so an opened one answers from whichever message carries
+        // the keyword.
+        let messages = (threadMessages[threadID] ?? []) + [email]
+        return messages.contains { $0.keywords?[SearchQuery.mutedKeyword] == true }
+    }
+
+    /// The messages below an opened row: every message in the conversation
+    /// except the one the row itself shows.
+    func expandedMessages(for email: EmailPreview) -> [EmailPreview] {
+        guard let threadID = email.threadId, expandedThreadIDs.contains(threadID) else {
+            return []
+        }
+
+        return (threadMessages[threadID] ?? []).filter { $0.id != email.id }
+    }
+
+    func toggleExpansion(of email: EmailPreview) async {
+        guard let threadID = email.threadId else {
+            return
+        }
+
+        if expandedThreadIDs.contains(threadID) {
+            expandedThreadIDs.remove(threadID)
+            return
+        }
+
+        expandedThreadIDs.insert(threadID)
+        await loadThread(threadID)
+    }
+
+    private func collapseAllThreads() {
+        expandedThreadIDs = []
+        threadMessages = [:]
+    }
+
+    /// Fetches a conversation's messages. Kept even after the row is closed, so
+    /// reopening it is instant; the sync path drops the entry when the server
+    /// says the thread changed.
+    private func loadThread(_ threadID: String) async {
+        guard threadMessages[threadID] == nil, !loadingThreadIDs.contains(threadID) else {
+            return
+        }
+
+        guard let client = makeClient(), let session, let accountID else {
+            return
+        }
+
+        loadingThreadIDs.insert(threadID)
+        defer { loadingThreadIDs.remove(threadID) }
+
+        do {
+            let messages = try await client.fetchThreadEmails(
+                session: session,
+                accountID: accountID,
+                threadID: threadID
+            )
+
+            threadMessages[threadID] = messages.sorted {
+                ($0.receivedAt ?? .distantPast) < ($1.receivedAt ?? .distantPast)
+            }
+        } catch {
+            expandedThreadIDs.remove(threadID)
+            emailsErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Mutes or unmutes the whole conversation.
+    ///
+    /// A muted conversation drops out of the Inbox listing on the next query
+    /// rather than being removed here: the server decides what the filter
+    /// matches, and pretending otherwise would put the row back the moment
+    /// anything refreshed.
+    func toggleMute(for email: EmailPreview) async {
+        guard let threadID = email.threadId, !mutingThreadIDs.contains(threadID) else {
+            return
+        }
+
+        guard let client = makeClient(), let session, let accountID else {
+            return
+        }
+
+        // Every message in the thread, from whichever source knows them all.
+        let ids = threadEmailIDs[threadID]
+            ?? threadMessages[threadID]?.map(\.id)
+            ?? [email.id]
+        let shouldMute = !isMuted(email)
+
+        mutingThreadIDs.insert(threadID)
+        defer { mutingThreadIDs.remove(threadID) }
+
+        do {
+            try await client.setThreadKeyword(
+                session: session,
+                accountID: accountID,
+                emailIDs: ids,
+                keyword: SearchQuery.mutedKeyword,
+                isSet: shouldMute
+            )
+
+            threadMessages[threadID] = nil
+            expandedThreadIDs.remove(threadID)
+
+            if let selectedMailboxID {
+                await loadEmails(mailboxID: selectedMailboxID)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -721,6 +925,8 @@ final class MailStore: ObservableObject {
             // in until the query lands; otherwise this empties the list and the
             // skeleton shows, as before.
             emails = cachedPage(for: mailboxID)
+            threadEmailIDs = [:]
+            collapseAllThreads()
         }
 
         selectedMailboxID = mailboxID
@@ -738,10 +944,12 @@ final class MailStore: ObservableObject {
                 mailboxID: mailboxID,
                 position: 0,
                 limit: emailPageSize,
-                searchFilter: listFilter(mailboxID: mailboxID)
+                searchFilter: listFilter(mailboxID: mailboxID),
+                collapseThreads: groupsIntoThreads
             )
 
             emails = page.previews
+            threadEmailIDs = page.threadEmailIDs
             applyPageMetadata(page)
             loadedMailboxID = mailboxID
             selectedEmailID = emails.first?.id
@@ -776,17 +984,40 @@ final class MailStore: ObservableObject {
 
         isLoadingMoreEmails = true
         let search = activeSearch
-        let nextPosition = emails.count
+        let filter = listFilter(mailboxID: mailboxID)
 
-        do {
-            let page = try await client.fetchEmailPreviews(
+        // Page from the last row rather than from a count. `position` is an
+        // index into results the server recomputes every time, so mail arriving
+        // while the user scrolls shifts everything down and page two repeats or
+        // skips whatever crossed the boundary. An anchor is an id, and stays
+        // pointing at the same message however much lands above it.
+        func fetchPage(anchoredTo anchor: String?) async throws -> JMAPClient.EmailPreviewPage {
+            try await client.fetchEmailPreviews(
                 session: session,
                 accountID: accountID,
                 mailboxID: mailboxID,
-                position: nextPosition,
+                position: emails.count,
+                anchor: anchor,
+                anchorOffset: anchor == nil ? 0 : 1,
                 limit: emailPageSize,
-                searchFilter: listFilter(mailboxID: mailboxID)
+                searchFilter: filter,
+                collapseThreads: groupsIntoThreads
             )
+        }
+
+        do {
+            let page: JMAPClient.EmailPreviewPage
+
+            do {
+                page = try await fetchPage(anchoredTo: emails.last?.id)
+            } catch JMAPError.methodError("anchorNotFound") {
+                // The last row left the result set between pages — filed
+                // elsewhere, or, grouped, superseded as its conversation's
+                // representative by a newer reply. An offset is wrong in
+                // exactly the way described above, but it is wrong by a row or
+                // two rather than fetching nothing at all.
+                page = try await fetchPage(anchoredTo: nil)
+            }
 
             // Guard against a mailbox/search switch that landed mid-request.
             guard selectedMailboxID == mailboxID, activeSearch == search else {
@@ -796,6 +1027,7 @@ final class MailStore: ObservableObject {
 
             let known = Set(emails.map(\.id))
             emails.append(contentsOf: page.previews.filter { !known.contains($0.id) })
+            threadEmailIDs.merge(page.threadEmailIDs) { _, new in new }
             applyPageMetadata(page)
         } catch {
             emailsErrorMessage = error.localizedDescription
@@ -1991,6 +2223,18 @@ final class MailStore: ObservableObject {
                 .settingFlagged(refreshed.isFlagged)
         }
 
+        // A conversation whose contents changed has to be refetched before it
+        // can be shown again, and its message count may have moved.
+        let changedThreads = Set(previews.compactMap(\.threadId))
+        for threadID in changedThreads {
+            threadMessages[threadID] = nil
+            if let existing = threadEmailIDs[threadID] {
+                threadEmailIDs[threadID] = existing + previews
+                    .filter { $0.threadId == threadID && !existing.contains($0.id) }
+                    .map(\.id)
+            }
+        }
+
         // New messages belonging to the currently displayed mailbox drop in at
         // the top (the list is sorted newest-first) if not already present.
         if let selectedMailboxID, activeSearch == nil {
@@ -2003,7 +2247,21 @@ final class MailStore: ObservableObject {
                         && matchesActiveTag($0)
                 }
                 .sorted { ($0.receivedAt ?? .distantPast) > ($1.receivedAt ?? .distantPast) }
+
+            // Grouped, a row stands for a whole conversation: a reply arriving
+            // in one already listed replaces that row rather than opening a
+            // second one for the same thread.
+            if groupsIntoThreads {
+                let arrivingThreads = Set(additions.compactMap(\.threadId))
+                emails.removeAll { $0.threadId.map(arrivingThreads.contains) ?? false }
+            }
+
             emails.insert(contentsOf: additions, at: 0)
+        }
+
+        // Reopen whatever the user had open, with the new messages in it.
+        for threadID in expandedThreadIDs where changedThreads.contains(threadID) {
+            Task { await loadThread(threadID) }
         }
 
         // Notifications: new, unread, recent mail in any mailbox the user has
@@ -2041,7 +2299,8 @@ final class MailStore: ObservableObject {
                 accountID: accountID,
                 mailboxID: mailboxID,
                 limit: max(emailPageSize, emails.count),
-                searchFilter: listFilter(mailboxID: mailboxID)
+                searchFilter: listFilter(mailboxID: mailboxID),
+                collapseThreads: groupsIntoThreads
             )
 
             guard selectedMailboxID == mailboxID, activeSearch == nil else {
@@ -2050,6 +2309,7 @@ final class MailStore: ObservableObject {
 
             let previousSelection = selectedEmailID
             emails = page.previews
+            threadEmailIDs = page.threadEmailIDs
             applyPageMetadata(page)
 
             if let previousSelection, page.previews.contains(where: { $0.id == previousSelection }) {
