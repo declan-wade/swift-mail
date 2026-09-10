@@ -38,6 +38,15 @@ nonisolated struct MailTag: Identifiable, Hashable, Codable {
         return addresses.contains { Self.pattern($0, matches: wanted) }
     }
 
+    /// Whether this tag names the address itself, rather than covering it with
+    /// a domain wildcard. This is the difference that lets an address be moved:
+    /// see `tag(forAddress:)`.
+    func containsExactly(address: String) -> Bool {
+        let wanted = address.lowercased()
+
+        return addresses.contains { $0.lowercased() == wanted && Self.wildcardDomain($0.lowercased()) == nil }
+    }
+
     /// Whether this message is this tag's mail — delivered to one of its
     /// aliases, addressed to one, or sent from one. The sender half is what
     /// makes Sent and Drafts sort correctly, where your own address is in
@@ -91,7 +100,7 @@ nonisolated struct MailTag: Identifiable, Hashable, Codable {
         return address.hasSuffix(domain)
     }
 
-    private static func wildcardDomain(_ pattern: String) -> String? {
+    static func wildcardDomain(_ pattern: String) -> String? {
         if pattern.hasPrefix("*@") {
             return String(pattern.dropFirst())
         }
@@ -184,11 +193,30 @@ nonisolated enum TagColor: String, CaseIterable, Codable, Identifiable {
 }
 
 nonisolated extension Array where Element == MailTag {
-    /// The tag a message belongs to — the first whose aliases it involves. A
-    /// message can reach two of your addresses at once, so the list's own
-    /// order is the tiebreak and the answer stays stable between renders.
+    /// The tag a message belongs to. A message can reach two of your addresses
+    /// at once, so the list's own order is the tiebreak and the answer stays
+    /// stable between renders.
     func tag(for email: EmailPreview) -> MailTag? {
-        first { $0.matches(email) }
+        let correspondents = MailTag.correspondents(of: email)
+
+        return tag { tag in correspondents.contains { tag.containsExactly(address: $0) } }
+            ?? tag { tag in correspondents.contains { tag.contains(address: $0) } }
+    }
+
+    /// The tag one address belongs to.
+    ///
+    /// An address written down by itself beats a `*@domain` wildcard that also
+    /// covers it. Without that precedence an address under someone else's
+    /// wildcard can't be reassigned at all: the new tag records it, and the
+    /// tag holding the wildcard goes on claiming it — so the pane and the
+    /// message list both keep showing the old tag, and the change looks like
+    /// it silently failed.
+    func tag(forAddress address: String) -> MailTag? {
+        tag { $0.containsExactly(address: address) } ?? tag { $0.contains(address: address) }
+    }
+
+    private func tag(where isMatch: (MailTag) -> Bool) -> MailTag? {
+        first(where: isMatch)
     }
 }
 

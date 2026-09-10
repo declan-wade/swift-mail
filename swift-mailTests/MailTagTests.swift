@@ -90,15 +90,45 @@ struct MailTagTests {
         #expect(!wildcard.matches(try preview(to: ["example.com@elsewhere.test"])))
     }
 
-    @Test("A message reaching two tags takes the first one listed")
+    @Test("Between two tags that both name the address, the first listed wins")
     func firstTagWins() throws {
-        let tags = [work, wildcard]
+        let other = MailTag(name: "Other", color: .teal, addresses: ["declan@example.com"])
+        let tags = [work, other]
         let email = try preview(to: ["declan@example.com"])
 
         #expect(tags.tag(for: email)?.name == "Work")
-        #expect(Array(tags.reversed()).tag(for: email)?.name == "Domain")
+        #expect(Array(tags.reversed()).tag(for: email)?.name == "Other")
         #expect(tags.tag(for: try preview(to: ["nobody@elsewhere.test"])) == nil)
         #expect([MailTag]().tag(for: email) == nil)
+    }
+
+    @Test("A named address beats a wildcard covering it, so it can be reassigned")
+    func namedAddressBeatsWildcard() throws {
+        // The whole bug this guards: with order alone deciding, an address
+        // under someone else's wildcard could never be moved — the new tag
+        // recorded it and the wildcard went on claiming it, so the change
+        // looked like it silently failed. `wildcard` is listed first here and
+        // still loses, because `legacy` names the address itself.
+        let legacy = MailTag(name: "Legacy", color: .red, addresses: ["declan@example.com"])
+        let tags = [wildcard, legacy]
+
+        #expect(tags.tag(for: try preview(to: ["declan@example.com"]))?.name == "Legacy")
+        #expect(tags.tag(forAddress: "declan@example.com")?.name == "Legacy")
+        #expect(tags.tag(forAddress: "DECLAN@example.com")?.name == "Legacy")
+
+        // An address the wildcard covers but nobody wrote down still belongs
+        // to the wildcard — precedence, not exclusion.
+        #expect(tags.tag(forAddress: "someone.else@example.com")?.name == "Domain")
+        #expect(tags.tag(for: try preview(to: ["someone.else@example.com"]))?.name == "Domain")
+        #expect(tags.tag(forAddress: "nobody@elsewhere.test") == nil)
+    }
+
+    @Test("A wildcard entry is never mistaken for a named address")
+    func wildcardIsNotAnExactEntry() {
+        #expect(!wildcard.containsExactly(address: "*@example.com"))
+        #expect(!wildcard.containsExactly(address: "declan@example.com"))
+        #expect(work.containsExactly(address: "declan@example.com"))
+        #expect(work.containsExactly(address: "Declan@Example.com"))
     }
 
     @Test("A tag with no aliases narrows nothing")

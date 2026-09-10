@@ -219,7 +219,9 @@ private struct TagSettings: View {
 
     private func tagBinding(for address: String) -> Binding<MailTag.ID?> {
         Binding(
-            get: { store.tags.first { $0.contains(address: address) }?.id },
+            // The same resolution the message list uses, so the pane can't
+            // disagree with the chips about which tag an address belongs to.
+            get: { store.tags.tag(forAddress: address)?.id },
             set: { store.assignAddress(address, toTagID: $0) }
         )
     }
@@ -247,8 +249,9 @@ private struct AddAddressRow: View {
 
     var body: some View {
         HStack(spacing: Theme.Spacing.sm) {
-            TextField("name@example.com", text: $text)
+            TextField("Custom alias", text: $text, prompt: Text("Custom alias"))
                 .textFieldStyle(.roundedBorder)
+                .labelsHidden()
                 .onSubmit(add)
 
             Picker("Tag", selection: Binding(get: { selectedTagID }, set: { tagID = $0 })) {
@@ -287,8 +290,13 @@ private struct TagRow: View {
                 .fill(tag.color.color)
                 .frame(width: Theme.Size.unreadDot + 2, height: Theme.Size.unreadDot + 2)
 
-            TextField("Name", text: $tag.name)
+            // Hiding the label is what widens the field: a `Form` otherwise
+            // spends the leading column on the title and right-aligns what's
+            // left, which is why the names sat hard against the colour picker.
+            TextField("Tag name", text: $tag.name, prompt: Text("Tag name"))
                 .textFieldStyle(.roundedBorder)
+                .labelsHidden()
+                .multilineTextAlignment(.leading)
 
             Picker("Colour", selection: $tag.color) {
                 ForEach(TagColor.allCases) { color in
