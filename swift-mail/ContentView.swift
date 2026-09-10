@@ -221,6 +221,21 @@ private struct MailHomeView: View {
             .help("Forward (⇧⌘F)")
             .keyboardShortcut("f", modifiers: [.command, .shift])
             .disabled(store.selectedEmail == nil)
+
+            // `ShareLink` is the whole feature: it raises the system share
+            // sheet with every service the user has enabled, so there is no
+            // `NSSharingServicePicker` to host and no service list to maintain.
+            // The readable body is what travels — the text a person would
+            // paste — with the subject filling in the title that Mail, Notes
+            // and Messages each ask for.
+            ShareLink(
+                item: store.selectedEmail?.readableBody ?? "",
+                subject: Text(store.selectedEmail?.subjectLine ?? "")
+            ) {
+                Label("Share", systemImage: "square.and.arrow.up")
+            }
+            .help("Share")
+            .disabled(store.selectedEmail == nil)
         }
 
         ToolbarSpacer(.flexible)
