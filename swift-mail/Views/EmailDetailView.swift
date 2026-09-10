@@ -62,7 +62,15 @@ struct EmailDetailView: View {
 
     @ViewBuilder
     private var content: some View {
-        if store.isLoadingSelectedEmail && store.selectedEmail == nil {
+        // Composing takes the whole pane: what is being written matters more
+        // than the message it was started from, which is still one click away
+        // in the list.
+        if let draft = store.inlineDraft {
+            ComposeView(store: store, draft: draft, placement: .inline)
+                // Seeded once per draft: without this, starting a second
+                // message would reuse the first one's editor state.
+                .id(draft.id)
+        } else if store.isLoadingSelectedEmail && store.selectedEmail == nil {
             SkeletonReader()
         } else if let error = store.detailErrorMessage, store.selectedEmail == nil {
             ContentUnavailableView {
@@ -193,13 +201,23 @@ private struct DraftPlaceholder: View {
         } actions: {
             Button("Edit Draft") { open() }
         }
-        .task(id: email.id) { open() }
+        .task(id: email.id) {
+            // Only when compose opens in a window. Inline, this view is the one
+            // the editor replaces and it comes back the moment the editor
+            // closes — auto-opening would reopen the draft forever, leaving no
+            // way to close it. The button below stays, which is all inline
+            // needs since the editor lands right here.
+            if !ComposePreferences.composesInline {
+                open()
+            }
+        }
     }
 
     private func open() {
-        openWindow(
-            id: ComposeWindow.id,
-            value: ComposeDraft.editDraft(from: email, identity: store.identity(id: nil))
+        openCompose(
+            ComposeDraft.editDraft(from: email, identity: store.identity(id: nil)),
+            store: store,
+            openWindow: openWindow
         )
     }
 }

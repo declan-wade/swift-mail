@@ -246,7 +246,7 @@ private struct MailHomeView: View {
     }
 
     private func compose(_ draft: ComposeDraft) {
-        openWindow(id: ComposeWindow.id, value: draft)
+        openCompose(draft, store: store, openWindow: openWindow)
     }
 }
 

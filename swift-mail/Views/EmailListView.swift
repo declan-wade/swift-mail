@@ -56,7 +56,7 @@ struct EmailListView: View {
     private var listToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .navigation) {
             Button {
-                openWindow(id: ComposeWindow.id, value: ComposeDraft.blank(identity: store.defaultIdentity))
+                openCompose(.blank(identity: store.defaultIdentity), store: store, openWindow: openWindow)
             } label: {
                 Label("New Message", systemImage: "square.and.pencil")
             }

@@ -352,6 +352,14 @@ final class MailStore: ObservableObject {
     @Published var emails: [EmailPreview] = []
     @Published var selectedEmailID: EmailPreview.ID?
     @Published var selectedEmail: EmailDetail?
+    /// The message being composed inside the reading pane, when compose is set
+    /// to open there rather than in its own window. The pane holds one at a
+    /// time; further composes go to windows.
+    @Published var inlineDraft: ComposeDraft?
+    /// What a draft looked like when it was last saved, for messages handed
+    /// from the pane to a window of their own. Deliberately not `@Published`:
+    /// the window reads it once on the way in, and nothing renders from it.
+    var composeBaselines: [ComposeDraft.ID: ComposeDraft] = [:]
     @Published var isLoadingMailboxes = false
     @Published var isLoadingEmails = false
     @Published var isLoadingMoreEmails = false

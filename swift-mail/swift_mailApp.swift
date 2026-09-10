@@ -98,7 +98,7 @@ private struct ComposeCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
             Button("New Message") {
-                openWindow(id: ComposeWindow.id, value: ComposeDraft.blank(identity: store.defaultIdentity))
+                openCompose(.blank(identity: store.defaultIdentity), store: store, openWindow: openWindow)
             }
             .keyboardShortcut("n", modifiers: .command)
         }

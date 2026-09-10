@@ -54,6 +54,7 @@ private struct GeneralSettings: View {
     @AppStorage(IntelligencePreferences.threadSummariesOffKey) private var threadSummariesOff = false
     @AppStorage(SenderWarningPreferences.impersonationOffKey) private var impersonationWarningsOff = false
     @AppStorage(IntelligencePreferences.messageTriageOffKey) private var messageTriageOff = false
+    @AppStorage(ComposePreferences.inlineKey) private var composesInline = false
 
     var body: some View {
         Form {
@@ -101,6 +102,19 @@ private struct GeneralSettings: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section {
+                Picker("New messages open", selection: $composesInline) {
+                    Text("In a separate window").tag(false)
+                    Text("In the reading pane").tag(true)
+                }
+            } header: {
+                Text("Composing")
+            } footer: {
+                Text("In the reading pane, a message being written replaces the one being read, and a button on its bar moves it out into a window at any time. A second message started while the pane is busy opens in a window either way.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {

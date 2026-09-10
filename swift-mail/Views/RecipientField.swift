@@ -23,7 +23,13 @@ struct RecipientField: NSViewRepresentable {
         field.isBordered = false
         field.drawsBackground = false
         field.focusRingType = .none
-        field.font = .preferredFont(forTextStyle: .body)
+        // Explicitly the plain system font, not `.preferredFont(forTextStyle: .body)`:
+        // the two are the same 13pt with the same ascender and descender, but the
+        // text-style font carries 0.69pt of leading. AppKit sizes the completion
+        // popup's window without that leading and lays its rows out with it, so
+        // every row overflowed by a fraction — clipping the top of the list and
+        // parking a scroller beside it however few matches there were.
+        field.font = .systemFont(ofSize: NSFont.systemFontSize)
         field.objectValue = addresses.map(\.editableText)
         field.setContentHuggingPriority(.defaultLow, for: .horizontal)
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -72,9 +78,60 @@ struct RecipientField: NSViewRepresentable {
             indexOfSelectedItem selectedIndex: UnsafeMutablePointer<Int>?
         ) -> [Any]? {
             selectedIndex?.pointee = -1
+            Self.padCompletionPopup()
 
             return completions(substring)
         }
+
+        /// AppKit lays the completion popup's first row flush against the
+        /// window's rounded top edge, and reserves a scroller's width whether
+        /// or not the list can scroll — which reads as a clipped first row
+        /// beside a scrollbar that does nothing. Both reproduce in a stock
+        /// `NSTokenField` in a plain window, and neither is reachable through
+        /// public API, so the window AppKit just built is adjusted directly.
+        ///
+        /// Best effort throughout: every step is a `guard`, so if the popup's
+        /// structure ever changes this quietly leaves it exactly as it was.
+        static func padCompletionPopup() {
+            // Deferred: the popup is built and sized after this delegate call
+            // returns, and resizes itself for each keystroke's match count.
+            DispatchQueue.main.async {
+                guard let popup = NSApp.windows.first(where: {
+                    String(describing: type(of: $0)) == "NSTextViewCompletionWindow"
+                }),
+                    // Deliberately not `isVisible`: AppKit's completion window
+                    // reports false while it is plainly on screen.
+                    let scrollView = popup.contentView as? NSScrollView,
+                    let documentHeight = scrollView.documentView?.frame.height,
+                    documentHeight > 0 else {
+                    return
+                }
+
+                scrollView.automaticallyAdjustsContentInsets = false
+                scrollView.contentInsets = NSEdgeInsets(top: rowInset, left: 0, bottom: rowInset, right: 0)
+
+                // The insets have to come out of a taller window rather than
+                // out of the rows, or the list would overflow by exactly the
+                // padding and become scrollable for no reason. The top edge
+                // stays put, under the field; the window grows downwards.
+                let wanted = documentHeight + rowInset * 2
+                var frame = popup.frame
+
+                if abs(frame.height - wanted) > 0.5 {
+                    frame.origin.y -= wanted - frame.height
+                    frame.size.height = wanted
+                    popup.setFrame(frame, display: true)
+                }
+
+                // Measured after the resize, since AppKit clamps the frame to
+                // the screen: the scroller earns its place only if the list
+                // genuinely didn't fit.
+                scrollView.hasVerticalScroller = scrollView.contentSize.height < documentHeight
+            }
+        }
+
+        /// Enough to lift the first row's ascenders off the window's edge.
+        private static let rowInset: CGFloat = 4
 
         static func parse(_ objectValue: Any?) -> [EmailAddress] {
             guard let entries = objectValue as? [Any] else {

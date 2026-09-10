@@ -6,6 +6,51 @@ enum ComposeWindow {
     static let id = "compose"
 }
 
+/// Where compose opens. Stored as the opt-in, so the default stays the
+/// separate window the app has always used.
+nonisolated enum ComposePreferences {
+    static let inlineKey = "swift-mail.compose.inline"
+
+    static var composesInline: Bool {
+        UserDefaults.standard.bool(forKey: inlineKey)
+    }
+
+    /// Window or pane. The pane holds one message at a time, so a compose
+    /// started while it is occupied gets a window whatever the preference says
+    /// — displacing a half-written message is worse than an extra window.
+    static func placement(composesInline: Bool, paneIsBusy: Bool) -> ComposePlacement {
+        composesInline && !paneIsBusy ? .inline : .window
+    }
+}
+
+/// Where a compose view is being shown. Only the chrome differs: a window gets
+/// the title bar and toolbar, the pane gets its own bar with a pop-out button.
+enum ComposePlacement: Equatable {
+    case window
+    case inline
+}
+
+/// The one place that decides window or pane, so every entry point — the New
+/// Message command, the toolbar, reply, forward, resuming a draft — honours the
+/// preference without repeating it.
+///
+/// The pane holds one message at a time. A second compose started while it is
+/// occupied opens in a window rather than displacing work in progress.
+@MainActor
+func openCompose(_ draft: ComposeDraft, store: MailStore, openWindow: OpenWindowAction) {
+    let placement = ComposePreferences.placement(
+        composesInline: ComposePreferences.composesInline,
+        paneIsBusy: store.inlineDraft != nil
+    )
+
+    switch placement {
+    case .inline:
+        store.inlineDraft = draft
+    case .window:
+        openWindow(id: ComposeWindow.id, value: draft)
+    }
+}
+
 /// How a compose window divides its space. Persisted, so a preference for
 /// working side by side survives closing the window.
 enum ComposeLayout: String {
@@ -55,10 +100,16 @@ struct ComposeView: View {
     @State private var isAttaching = false
     @State private var isDropTargeted = false
     @State private var statusMessage: String?
+    /// Inline has no window to close, so the save-draft prompt is raised by the
+    /// close button rather than by `dismissalConfirmationDialog`.
+    @State private var isConfirmingClose = false
+    let placement: ComposePlacement
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
 
-    init(store: MailStore, draft: ComposeDraft) {
+    init(store: MailStore, draft: ComposeDraft, placement: ComposePlacement = .window) {
         self.store = store
+        self.placement = placement
         _draft = State(initialValue: draft)
         _debouncedMarkdown = State(initialValue: draft.markdown)
         _savedDraft = State(initialValue: draft)
@@ -87,8 +138,62 @@ struct ComposeView: View {
         draft.hasChanges(from: savedDraft)
     }
 
+    @ViewBuilder
     var body: some View {
+        switch placement {
+        case .window:
+            core
+                // Two panes need room to be worth having; the window grows to meet it.
+                .frame(minWidth: layout == .split ? 900 : 560, minHeight: 440)
+                .navigationTitle(draft.windowTitle)
+                .toolbar { toolbar }
+
+        case .inline:
+            core
+                // The pane has no title bar to intercept, so its close button
+                // asks the same question directly.
+                .confirmationDialog(
+                    "Save this message as a draft?",
+                    isPresented: $isConfirmingClose
+                ) {
+                    saveOnCloseButtons(thenClose: true)
+                } message: {
+                    Text("Closing without saving will discard your changes.")
+                }
+        }
+    }
+
+    /// Both prompts offer the same three answers; only what raises them differs.
+    @ViewBuilder
+    private func saveOnCloseButtons(thenClose: Bool) -> some View {
+        Button("Save Draft") {
+            // Unstructured on purpose: this outlives the window being torn
+            // down, and a failure is reported through the store so it still
+            // surfaces once this window is gone.
+            Task { await saveOnClose() }
+
+            if thenClose {
+                close()
+            }
+        }
+
+        Button("Discard", role: .destructive) {
+            if thenClose {
+                close()
+            }
+        }
+
+        Button("Cancel", role: .cancel) {}
+    }
+
+    private var core: some View {
         VStack(spacing: 0) {
+            if placement == .inline {
+                inlineBar
+
+                Divider()
+            }
+
             ComposeHeader(draft: $draft, identities: store.identities, completions: store.recipientCompletions)
 
             Divider()
@@ -127,8 +232,6 @@ struct ComposeView: View {
             ComposeStatusBar(markdown: draft.markdown, status: statusMessage, layout: layout, previewMode: $previewMode)
         }
         .background(Color(nsColor: .textBackgroundColor))
-        // Two panes need room to be worth having; the window grows to meet it.
-        .frame(minWidth: layout == .split ? 900 : 560, minHeight: 440)
         .background {
             // ⇧⌘P keeps its old meaning: flip between writing and previewing,
             // returning to the editor from either layout that shows a preview.
@@ -161,8 +264,6 @@ struct ComposeView: View {
 
             debouncedMarkdown = draft.markdown
         }
-        .navigationTitle(draft.windowTitle)
-        .toolbar { toolbar }
         .task {
             if store.identities.isEmpty {
                 await store.loadIdentities()
@@ -171,24 +272,26 @@ struct ComposeView: View {
             if draft.identityID == nil {
                 draft.identityID = store.defaultIdentity?.id
             }
+
+            // A message handed over from the pane arrives already edited, so
+            // its window has to inherit what was last actually saved —
+            // otherwise the close prompt thinks there is nothing to lose.
+            if let baseline = store.composeBaselines.removeValue(forKey: draft.id) {
+                savedDraft = baseline
+            }
         }
         // Native window-close interception (macOS 15+), so ⌘W, the red button
         // and Quit all route through the same prompt without an
-        // `NSWindowDelegate` bridge.
+        // `NSWindowDelegate` bridge. It stays in the chain for both placements
+        // and simply never fires inline, where there is no window close to
+        // intercept — the close button asks instead.
         .dismissalConfirmationDialog(
             "Save this message as a draft?",
-            shouldPresent: hasUnsavedChanges
+            shouldPresent: placement == .window && hasUnsavedChanges
         ) {
-            Button("Save Draft") {
-                // Unstructured on purpose: this outlives the window being torn
-                // down, and a failure is reported through the store so it still
-                // surfaces once this window is gone.
-                Task { await saveOnClose() }
-            }
-
-            Button("Discard", role: .destructive) {}
-
-            Button("Cancel", role: .cancel) {}
+            // The window tears itself down after these; only the pane has to
+            // close itself.
+            saveOnCloseButtons(thenClose: false)
         } message: {
             Text("Closing without saving will discard your changes.")
         }
@@ -323,68 +426,136 @@ struct ComposeView: View {
     // since `.glassProminent` is a deliberate visual departure, not a fix.
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        ToolbarItem {
-            Picker("Layout", selection: $layout) {
-                Label("Editor", systemImage: "pencil").tag(ComposeLayout.editor)
-                Label("Split", systemImage: "rectangle.split.2x1").tag(ComposeLayout.split)
-                Label("Preview", systemImage: "eye").tag(ComposeLayout.preview)
-            }
-            .pickerStyle(.segmented)
-            .labelStyle(.iconOnly)
-            .help("Editor, side by side, or preview")
-        }
+        ToolbarItem { layoutPicker }
 
-
-        ToolbarItem {
-            Button {
-                isChoosingAttachments = true
-            } label: {
-                Label("Attach Files", systemImage: "paperclip")
-            }
-            .help("Attach Files (⇧⌘A)")
-            .keyboardShortcut("a", modifiers: [.command, .shift])
-            .disabled(isAttaching)
-        }
+        ToolbarItem { attachButton }
 
         ToolbarSpacer(.flexible)
 
-        ToolbarItem {
-            Button {
-                Task { await performSaveDraft() }
-            } label: {
-                Label("Save Draft", systemImage: "tray.and.arrow.down")
-            }
-            .help("Save Draft (⌘S)")
-            .keyboardShortcut("s", modifiers: .command)
-            .disabled(isSending || isSaving)
-        }
+        ToolbarItem { saveDraftButton }
 
-        ToolbarItem {
-            // A split button when the server will hold mail, a plain one when
-            // it won't: a menu whose only entries are unavailable is worse than
-            // no menu.
-            Group {
-                if store.supportsDelayedSend {
-                    Menu {
-                        sendLaterOptions
-                    } label: {
-                        sendLabel
-                    } primaryAction: {
-                        requestSend()
-                    }
-                } else {
-                    Button {
-                        requestSend()
-                    } label: {
-                        sendLabel
-                    }
+        ToolbarItem { sendControl }
+    }
+
+    /// The same controls the window puts in its toolbar, in a bar of the pane's
+    /// own — a `.toolbar` here would land in the main window's toolbar,
+    /// alongside Reply and Archive for the message underneath.
+    private var inlineBar: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            Button {
+                requestClose()
+            } label: {
+                // Icon-only, but still a `Label`: the text is what VoiceOver
+                // reads and what the tooltip repeats.
+                Label { Text("Close") } icon: { barIcon("xmark") }
+            }
+            .help("Close")
+            .labelStyle(.iconOnly)
+
+            Button {
+                popOut()
+            } label: {
+                Label { Text("Open in a Separate Window") } icon: {
+                    barIcon("arrow.down.backward.and.arrow.up.forward.square.fill")
                 }
             }
-            .help("Send (⌘↩)")
-            .keyboardShortcut(.return, modifiers: .command)
-            .disabled(!canSend)
-            .buttonStyle(.glassProminent)
+            .help("Open in a Separate Window")
+            .labelStyle(.iconOnly)
+
+            Text(draft.windowTitle)
+                .font(.headline)
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            Spacer(minLength: Theme.Spacing.sm)
+
+            layoutPicker
+                .fixedSize()
+
+            attachButton
+                .labelStyle(.iconOnly)
+
+            saveDraftButton
+                .labelStyle(.iconOnly)
+
+            sendControl
         }
+        .padding(.horizontal, Theme.Spacing.lg)
+        .padding(.vertical, Theme.Spacing.sm)
+        .background(.bar)
+    }
+
+    /// Every icon in the bar and the toolbar sits in a box of this size.
+    ///
+    /// A macOS button's background hugs its label, so glyphs of different
+    /// heights make buttons of different heights — a narrow ✕ next to the wide
+    /// pop-out is the visible case. An outer `.frame(height:)` doesn't fix it;
+    /// it only centres the button in a taller space. Equal labels do. 16pt is
+    /// the body text line height, so icon buttons match the one button that
+    /// carries a word: Send.
+    private func barIcon(_ systemImage: String) -> some View {
+        Image(systemName: systemImage)
+            .frame(width: 16, height: 16)
+    }
+
+    private var layoutPicker: some View {
+        Picker("Layout", selection: $layout) {
+            Label("Editor", systemImage: "pencil").tag(ComposeLayout.editor)
+            Label("Split", systemImage: "rectangle.split.2x1").tag(ComposeLayout.split)
+            Label("Preview", systemImage: "eye").tag(ComposeLayout.preview)
+        }
+        .pickerStyle(.segmented)
+        .labelStyle(.iconOnly)
+        .help("Editor, side by side, or preview")
+    }
+
+    private var attachButton: some View {
+        Button {
+            isChoosingAttachments = true
+        } label: {
+            Label { Text("Attach Files") } icon: { barIcon("paperclip") }
+        }
+        .help("Attach Files (⇧⌘A)")
+        .keyboardShortcut("a", modifiers: [.command, .shift])
+        .disabled(isAttaching)
+    }
+
+    private var saveDraftButton: some View {
+        Button {
+            Task { await performSaveDraft() }
+        } label: {
+            Label { Text("Save Draft") } icon: { barIcon("tray.and.arrow.down") }
+        }
+        .help("Save Draft (⌘S)")
+        .keyboardShortcut("s", modifiers: .command)
+        .disabled(isSending || isSaving)
+    }
+
+    private var sendControl: some View {
+        // A split button when the server will hold mail, a plain one when
+        // it won't: a menu whose only entries are unavailable is worse than
+        // no menu.
+        Group {
+            if store.supportsDelayedSend {
+                Menu {
+                    sendLaterOptions
+                } label: {
+                    sendLabel
+                } primaryAction: {
+                    requestSend()
+                }
+            } else {
+                Button {
+                    requestSend()
+                } label: {
+                    sendLabel
+                }
+            }
+        }
+        .help("Send (⌘↩)")
+        .keyboardShortcut(.return, modifiers: .command)
+        .disabled(!canSend)
+        .buttonStyle(.glassProminent)
     }
 
     @ViewBuilder
@@ -393,7 +564,7 @@ struct ComposeView: View {
             ProgressView()
                 .controlSize(.small)
         } else {
-            Label("Send", systemImage: "paperplane.fill")
+            Label { Text("Send") } icon: { barIcon("paperplane.fill") }
         }
     }
 
@@ -447,7 +618,7 @@ struct ComposeView: View {
             // this the close below would raise the save-draft prompt on a
             // message that has just been sent.
             savedDraft = draft
-            dismiss()
+            close()
         } catch {
             statusMessage = nil
             errorMessage = error.localizedDescription
@@ -466,6 +637,40 @@ struct ComposeView: View {
         } catch {
             store.errorMessage = "The draft could not be saved: \(error.localizedDescription)"
         }
+    }
+
+    /// Closing: the window dismisses itself, the pane just stops showing this.
+    private func close() {
+        switch placement {
+        case .window:
+            dismiss()
+        case .inline:
+            store.inlineDraft = nil
+        }
+    }
+
+    /// Inline only — the window's own close button routes through
+    /// `dismissalConfirmationDialog` instead.
+    private func requestClose() {
+        commitPendingEdits()
+
+        if hasUnsavedChanges {
+            isConfirmingClose = true
+        } else {
+            close()
+        }
+    }
+
+    /// Hands the message, edits and all, to a window of its own. The window is
+    /// seeded from the live draft rather than the one the pane was opened with,
+    /// so nothing typed here is left behind.
+    private func popOut() {
+        commitPendingEdits()
+        // The window is seeded with the live draft, so what counts as unsaved
+        // has to travel with it.
+        store.composeBaselines[draft.id] = savedDraft
+        store.inlineDraft = nil
+        openWindow(id: ComposeWindow.id, value: draft)
     }
 
     private func performSaveDraft() async {
