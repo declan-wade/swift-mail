@@ -395,6 +395,11 @@ final class MailStore: ObservableObject {
     @Published var updatingFlagEmailIDs: Set<EmailPreview.ID> = []
     @Published var movingEmailIDs: Set<EmailPreview.ID> = []
     @Published var identities: [MailIdentity] = []
+    @Published private(set) var maskedEmails: [MaskedEmail] = []
+    @Published private(set) var isLoadingMaskedEmails = false
+    /// Reported in the masked-email window rather than the main alert: nothing
+    /// in the mail window depends on this having worked.
+    @Published var maskedEmailErrorMessage: String?
     /// The colour-coded tags the account's aliases are grouped into. Empty is
     /// the default, and an empty list means the app behaves exactly as it did
     /// before tags existed — no chips, no labels, no narrowing.
@@ -1946,6 +1951,100 @@ final class MailStore: ObservableObject {
 
     /// Identities are optional: an account without submission support can still
     /// read mail, so a failure here is not surfaced as a mail error.
+    /// Whether this account's token carries the Masked Email scope.
+    ///
+    /// A Fastmail API token is scoped when it is made, so an existing token
+    /// simply won't advertise the capability — the UI says so rather than
+    /// failing a request the server was never going to answer.
+    var supportsMaskedEmail: Bool {
+        session?.supports(JMAPCapability.maskedEmailURN, accountID: accountID) ?? false
+    }
+
+    func loadMaskedEmails() async {
+        isLoadingMaskedEmails = true
+        defer { isLoadingMaskedEmails = false }
+
+        do {
+            let context = try await apiContext()
+
+            guard supportsMaskedEmail else {
+                maskedEmails = []
+                return
+            }
+
+            maskedEmails = try await context.client
+                .fetchMaskedEmails(session: context.session, accountID: context.accountID)
+                .sorted(by: MaskedEmail.inUseOrder)
+            maskedEmailErrorMessage = nil
+        } catch {
+            maskedEmailErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Creates an address and returns it, so the caller can put it on the
+    /// clipboard — which is the only reason anyone makes one.
+    func createMaskedEmail(forDomain: String, note: String, prefix: String) async -> MaskedEmail? {
+        do {
+            let context = try await apiContext()
+            let created = try await context.client.createMaskedEmail(
+                session: context.session,
+                accountID: context.accountID,
+                forDomain: forDomain,
+                note: note,
+                prefix: prefix
+            )
+
+            maskedEmails = ([created] + maskedEmails).sorted(by: MaskedEmail.inUseOrder)
+            maskedEmailErrorMessage = nil
+
+            return created
+        } catch {
+            maskedEmailErrorMessage = error.localizedDescription
+
+            return nil
+        }
+    }
+
+    /// Blocks, unblocks or deletes an address. Every one of these is a state
+    /// change rather than a destroy, so all three are reversible.
+    func setMaskedEmailState(id: MaskedEmail.ID, to state: MaskedEmailState) async {
+        await updateMaskedEmail(id: id, state: state, note: nil)
+    }
+
+    func setMaskedEmailNote(id: MaskedEmail.ID, to note: String) async {
+        await updateMaskedEmail(id: id, state: nil, note: note)
+    }
+
+    private func updateMaskedEmail(id: MaskedEmail.ID, state: MaskedEmailState?, note: String?) async {
+        do {
+            let context = try await apiContext()
+            try await context.client.updateMaskedEmail(
+                session: context.session,
+                accountID: context.accountID,
+                id: id,
+                state: state,
+                note: note
+            )
+
+            // Applied locally rather than refetching the whole list: the
+            // server accepted the patch, and a round trip here would blank the
+            // list mid-edit.
+            if let index = maskedEmails.firstIndex(where: { $0.id == id }) {
+                if let state {
+                    maskedEmails[index].state = state
+                }
+
+                if let note {
+                    maskedEmails[index].note = note
+                }
+            }
+
+            maskedEmailErrorMessage = nil
+        } catch {
+            maskedEmailErrorMessage = error.localizedDescription
+        }
+    }
+
     func loadIdentities() async {
         guard let client = makeClient(), let session else {
             return

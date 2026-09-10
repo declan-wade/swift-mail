@@ -32,6 +32,11 @@ struct swift_mailApp: App {
         }
         .defaultSize(width: 760, height: 620)
 
+        Window("Masked Email", id: MaskedEmailWindow.id) {
+            MaskedEmailView(store: store)
+        }
+        .defaultSize(width: 720, height: 520)
+
         Settings {
             SettingsView(store: store)
         }
@@ -101,6 +106,11 @@ private struct ComposeCommands: Commands {
                 openCompose(.blank(identity: store.defaultIdentity), store: store, openWindow: openWindow)
             }
             .keyboardShortcut("n", modifiers: .command)
+
+            Button("Masked Email\u{2026}") {
+                openWindow(id: MaskedEmailWindow.id)
+            }
+            .keyboardShortcut("m", modifiers: [.command, .shift])
         }
     }
 }

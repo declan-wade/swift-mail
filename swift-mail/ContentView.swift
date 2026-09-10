@@ -240,7 +240,30 @@ private struct MailHomeView: View {
 
         ToolbarSpacer(.flexible)
 
-        ToolbarItem {
+        // The flexible spacer above collapses to zero in a narrow window, and
+        // the groups either side of it then merge into one capsule — which is
+        // how this button ended up looking like part of the reply group. A
+        // fixed spacer keeps the gap at every window width.
+        ToolbarSpacer(.fixed)
+
+        ToolbarItemGroup {
+            Button {
+                openWindow(id: MaskedEmailWindow.id)
+            } label: {
+                // The badge and shield hang below the envelope, so this glyph's
+                // ink sits above the centre of its own box — measured at 1.5px
+                // against 0.5px for person.crop.circle beside it — and it rides
+                // visibly high. Optical alignment, so it's a nudge rather than
+                // a layout rule.
+                Label {
+                    Text("Masked Email")
+                } icon: {
+                    Image(systemName: "envelope.badge.shield.half.filled")
+                        .offset(y: 1)
+                }
+            }
+            .help("Masked Email (⇧⌘M)")
+
             Menu {
                 Button("Remove Account", role: .destructive) {
                     store.removeAccount()

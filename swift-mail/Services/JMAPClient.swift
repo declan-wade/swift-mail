@@ -1060,6 +1060,129 @@ final class JMAPClient {
         throw JMAPError.setError(type ?? "unknown", detail)
     }
 
+    // MARK: - Masked Email
+
+    /// Every masked address on the account, including deleted ones — the UI
+    /// filters those out, but recovering one means being able to see it.
+    func fetchMaskedEmails(session: JMAPSession, accountID: String) async throws -> [MaskedEmail] {
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                ["MaskedEmail/get", ["accountId": accountID, "ids": NSNull()], "maskedEmails"]
+            ],
+            using: JMAPCapability.maskedEmail
+        )
+
+        let payload = try response.payload(named: "MaskedEmail/get", clientID: "maskedEmails")
+        let listData = try JSONSerialization.data(withJSONObject: payload["list"] ?? [])
+
+        return try decoder.decode([MaskedEmail].self, from: listData)
+    }
+
+    /// Creates one address and reads it back in the same request.
+    ///
+    /// A `/set` response carries only the properties the server chose, so the
+    /// created id is fed straight into a `/get` by back-reference rather than
+    /// stitching a half-server, half-local object together here.
+    func createMaskedEmail(
+        session: JMAPSession,
+        accountID: String,
+        forDomain: String?,
+        note: String?,
+        prefix: String?
+    ) async throws -> MaskedEmail {
+        var create: [String: Any] = ["state": MaskedEmailState.enabled.rawValue]
+
+        // Sent only when they hold something: Fastmail treats an empty prefix
+        // as a request for an empty prefix rather than as "you choose".
+        if let forDomain = forDomain?.nilIfEmpty {
+            create["forDomain"] = forDomain
+        }
+
+        if let note = note?.nilIfEmpty {
+            create["description"] = note
+        }
+
+        if let prefix = prefix?.nilIfEmpty {
+            create["emailPrefix"] = prefix
+        }
+
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "MaskedEmail/set",
+                    ["accountId": accountID, "create": ["new": create]],
+                    "createMaskedEmail"
+                ],
+                [
+                    "MaskedEmail/get",
+                    [
+                        "accountId": accountID,
+                        "#ids": [
+                            "resultOf": "createMaskedEmail",
+                            "name": "MaskedEmail/set",
+                            "path": "/created/new/id"
+                        ]
+                    ],
+                    "createdMaskedEmail"
+                ]
+            ],
+            using: JMAPCapability.maskedEmail
+        )
+
+        let setPayload = try response.payload(named: "MaskedEmail/set", clientID: "createMaskedEmail")
+        try Self.throwIfRejected(setPayload, key: "notCreated")
+
+        let payload = try response.payload(named: "MaskedEmail/get", clientID: "createdMaskedEmail")
+        let listData = try JSONSerialization.data(withJSONObject: payload["list"] ?? [])
+
+        guard let created = try decoder.decode([MaskedEmail].self, from: listData).first else {
+            throw JMAPError.invalidResponse
+        }
+
+        return created
+    }
+
+    /// Patches one address. Only the named properties are sent, so two clients
+    /// changing different fields don't overwrite each other.
+    func updateMaskedEmail(
+        session: JMAPSession,
+        accountID: String,
+        id: String,
+        state: MaskedEmailState? = nil,
+        note: String? = nil
+    ) async throws {
+        var patch: [String: Any] = [:]
+
+        if let state {
+            patch["state"] = state.rawValue
+        }
+
+        if let note {
+            patch["description"] = note
+        }
+
+        guard !patch.isEmpty else {
+            return
+        }
+
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "MaskedEmail/set",
+                    ["accountId": accountID, "update": [id: patch]],
+                    "updateMaskedEmail"
+                ]
+            ],
+            using: JMAPCapability.maskedEmail
+        )
+
+        let payload = try response.payload(named: "MaskedEmail/set", clientID: "updateMaskedEmail")
+        try Self.throwIfRejected(payload, key: "notUpdated")
+    }
+
     private func call(
         apiURL: URL,
         methodCalls: [[Any]],
@@ -1137,7 +1260,13 @@ nonisolated enum JMAPCapability {
     /// checked at runtime rather than assumed.
     static let snoozeURN = "urn:ietf:params:jmap:mail:snooze"
 
+    /// Fastmail's Masked Email extension. Vendor-specific and gated on the API
+    /// token's own scope, so a token without it simply doesn't advertise the
+    /// capability — which is the check the UI keys off.
+    static let maskedEmailURN = "https://www.fastmail.com/dev/maskedemail"
+
     static let mail = [core, mailURN]
+    static let maskedEmail = [core, maskedEmailURN]
     /// Submission requests still touch `Email` objects, so mail comes along.
     static let submission = [core, mailURN, submissionURN]
 }
