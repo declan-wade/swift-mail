@@ -2,17 +2,48 @@ import SwiftUI
 
 struct MailboxSidebarView: View {
     @ObservedObject var store: MailStore
+    /// Collapsed state sticks: someone who works out of the system mailboxes
+    /// and keeps forty folders folded away shouldn't refold them every launch.
+    @AppStorage("swift-mail.sidebar.foldersExpanded") private var foldersExpanded = true
+    @AppStorage("swift-mail.sidebar.favouritesExpanded") private var favouritesExpanded = true
+    @AppStorage(FavouriteMailboxes.storageKey) private var favouriteList = ""
 
     var body: some View {
         List(selection: $store.selectedMailboxID) {
             let roots = MailboxNode.tree(from: store.mailboxes)
+            let favouriteIDs = FavouriteMailboxes.ids(in: favouriteList)
+            // Filtered from the full list rather than from the roots, so a
+            // nested folder can be favourited too.
+            let favourites = store.mailboxes.filter { favouriteIDs.contains($0.id) }
 
             Section(store.account?.displayName ?? "Mail") {
                 rows(for: roots.filter(\.mailbox.isSystem))
             }
 
-            Section("Folders") {
+            // Absent entirely when nothing is favourited: an empty section
+            // header is a promise of content that isn't there.
+            if !favourites.isEmpty {
+                Section(isExpanded: $favouritesExpanded) {
+                    // Flat, not a tree: a favourite is one mailbox someone
+                    // picked, and dragging its children along would make
+                    // favouriting a parent a different act from favouriting
+                    // any other folder.
+                    ForEach(favourites) { mailbox in
+                        MailboxRow(mailbox: mailbox)
+                            .tag(mailbox.id)
+                    }
+                } header: {
+                    Text("Favourites")
+                }
+            }
+
+            // Favourites and Folders collapse; the account's own mailboxes
+            // don't. That's where mail is actually read, and a sidebar whose
+            // Inbox can be hidden behind a triangle is one that will hide it.
+            Section(isExpanded: $foldersExpanded) {
                 rows(for: roots.filter { !$0.mailbox.isSystem })
+            } header: {
+                Text("Folders")
             }
         }
         .navigationSplitViewColumnWidth(min: Theme.Column.sidebar.min, ideal: Theme.Column.sidebar.ideal)
@@ -136,6 +167,11 @@ struct MailboxNode: Identifiable {
 
 private struct MailboxRow: View {
     let mailbox: Mailbox
+    @AppStorage(FavouriteMailboxes.storageKey) private var favouriteList = ""
+
+    private var isFavourite: Bool {
+        FavouriteMailboxes.ids(in: favouriteList).contains(mailbox.id)
+    }
 
     var body: some View {
         Label {
@@ -150,6 +186,16 @@ private struct MailboxRow: View {
             }
         } icon: {
             Image(systemName: mailbox.iconName)
+        }
+        // On the row itself, so the same menu is there whether the row is read
+        // from Favourites, Folders or the account's own mailboxes.
+        .contextMenu {
+            Button(
+                isFavourite ? "Remove from Favourites" : "Add to Favourites",
+                systemImage: isFavourite ? "star.slash" : "star"
+            ) {
+                favouriteList = FavouriteMailboxes.toggling(mailbox.id, in: favouriteList)
+            }
         }
     }
 }

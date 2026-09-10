@@ -34,6 +34,33 @@ nonisolated enum NotifyingMailboxes {
     }
 }
 
+/// Mailboxes pinned above the folder list.
+///
+/// Same shape as `NotifyingMailboxes` — a comma-separated id list in
+/// `UserDefaults` — because it is the same question asked about a different
+/// set, and one string is the whole feature: no store, no sync, no migration.
+nonisolated enum FavouriteMailboxes {
+    static let storageKey = "swift-mail.favouriteMailboxIDs"
+
+    static func ids(in list: String) -> Set<String> {
+        Set(list.split(separator: ",").compactMap { $0.trimmingCharacters(in: .whitespaces).nilIfEmpty })
+    }
+
+    static func list(from ids: Set<String>) -> String {
+        ids.sorted().joined(separator: ",")
+    }
+
+    static func toggling(_ id: String, in list: String) -> String {
+        var ids = ids(in: list)
+
+        if ids.remove(id) == nil {
+            ids.insert(id)
+        }
+
+        return self.list(from: ids)
+    }
+}
+
 /// How the reader treats the message it opens.
 nonisolated enum ReadingPreferences {
     /// Off (the default) keeps the explicit Mark as Read button as the only way
