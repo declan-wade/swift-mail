@@ -112,41 +112,97 @@ struct ThreadSummaryTests {
         #expect(ThreadSummarizer.maximumMessages > ThreadSummarizer.minimumMessages)
     }
 
+    // MARK: - "Nothing to report"
+
+    @Test("A list that only says there is nothing in it comes back empty")
+    func dropsNoOpEntries() {
+        // What the model actually returned when asked for no actions.
+        #expect(ThreadSummary.meaningful(["No actions needed."]).isEmpty)
+        #expect(ThreadSummary.meaningful(["None."]).isEmpty)
+        #expect(ThreadSummary.meaningful(["Nothing further is required."]).isEmpty)
+        #expect(ThreadSummary.meaningful(["No follow-up required"]).isEmpty)
+        #expect(ThreadSummary.meaningful(["N/A"]).isEmpty)
+        #expect(ThreadSummary.meaningful(["   "]).isEmpty)
+        #expect(ThreadSummary.meaningful(nil).isEmpty)
+    }
+
+    @Test("A real action that happens to start with a negation survives")
+    func keepsRealActions() {
+        #expect(ThreadSummary.meaningful(["No need to reply to Ben"]) == ["No need to reply to Ben"])
+        #expect(ThreadSummary.meaningful(["Note the new 10am time"]) == ["Note the new 10am time"])
+        #expect(ThreadSummary.meaningful(["Confirm the room booking"]) == ["Confirm the room booking"])
+
+        // A long entry is a thing, not a shrug, however it opens.
+        let long = "No decision was reached on the vendor, so Ana will circulate the comparison before Friday"
+        #expect(ThreadSummary.meaningful([long]) == [long])
+    }
+
+    @Test("Filtering keeps the real entries alongside a dropped one")
+    func filtersInPlace() {
+        let mixed = ["Confirm the room booking", "None.", "Send Ben the deck"]
+
+        #expect(ThreadSummary.meaningful(mixed) == ["Confirm the room booking", "Send Ben the deck"])
+    }
+
+    @Test("The same action listed twice is shown once")
+    func dropsRepeats() {
+        // What the model actually returned: the same action, once with a full
+        // stop and once without. Two identical bullets, and a duplicate id
+        // inside the `ForEach` that renders them.
+        let repeated = [
+            "Send Q3 figures before Friday.",
+            "Send regional splits from Declan to Ben.",
+            "Send regional splits from Declan to Ben"
+        ]
+
+        #expect(ThreadSummary.meaningful(repeated) == [
+            "Send Q3 figures before Friday.",
+            "Send regional splits from Declan to Ben."
+        ])
+
+        // The first spelling wins, whichever way round they arrive.
+        #expect(ThreadSummary.meaningful(["Reply to Ben", "reply to ben."]) == ["Reply to Ben"])
+
+        // Different actions that merely start alike are both kept.
+        let distinct = ["Send Ben the deck", "Send Ana the deck"]
+        #expect(ThreadSummary.meaningful(distinct) == distinct)
+    }
+
     // MARK: - What the reader is told
 
     @Test("Only a fixable reason is worth telling the reader about")
     func explainsUnavailability() {
-        #expect(ThreadSummarizer.advice(for: .available) == nil)
+        #expect(IntelligenceStatus.advice(for: .available) == nil)
 
         // Fixable: say so, or the reader just sees the feature missing.
-        let off = ThreadSummarizer.advice(for: .unavailable(.appleIntelligenceNotEnabled))
+        let off = IntelligenceStatus.advice(for: .unavailable(.appleIntelligenceNotEnabled))
         #expect(off?.contains("System Settings") == true)
-        #expect(ThreadSummarizer.advice(for: .unavailable(.modelNotReady)) != nil)
+        #expect(IntelligenceStatus.advice(for: .unavailable(.modelNotReady)) != nil)
 
         // Not fixable: a Mac that isn't eligible never will be, so a notice on
         // every long thread would be a standing complaint about the hardware.
-        #expect(ThreadSummarizer.advice(for: .unavailable(.deviceNotEligible)) == nil)
+        #expect(IntelligenceStatus.advice(for: .unavailable(.deviceNotEligible)) == nil)
     }
 
     @Test("Failures are reported as sentences, not as framework type names")
     func explainsFailures() {
-        let tooLong = ThreadSummarizer.message(
+        let tooLong = IntelligenceStatus.message(
             for: LanguageModelSession.GenerationError.exceededContextWindowSize(
                 .init(debugDescription: "context")
             )
         )
-        #expect(tooLong == "This thread is too long to summarise.")
+        #expect(tooLong == "That was too long for Apple Intelligence to read.")
 
-        let refused = ThreadSummarizer.message(
+        let refused = IntelligenceStatus.message(
             for: LanguageModelSession.GenerationError.guardrailViolation(
                 .init(debugDescription: "guardrail")
             )
         )
-        #expect(refused.contains("wouldn’t summarise"))
+        #expect(refused.contains("declined"))
 
         // Anything unrecognised still says something a person can read.
-        let unknown = ThreadSummarizer.message(for: URLError(.notConnectedToInternet))
-        #expect(unknown == "Couldn’t summarise this thread.")
+        let unknown = IntelligenceStatus.message(for: URLError(.notConnectedToInternet))
+        #expect(unknown == "Apple Intelligence couldn’t finish.")
         #expect(!unknown.contains("Error"))
     }
 }

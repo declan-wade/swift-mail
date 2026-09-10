@@ -53,6 +53,7 @@ private struct GeneralSettings: View {
     @AppStorage(DownloadPreferences.bookmarkKey) private var downloadBookmark: Data?
     @AppStorage(IntelligencePreferences.threadSummariesOffKey) private var threadSummariesOff = false
     @AppStorage(SenderWarningPreferences.impersonationOffKey) private var impersonationWarningsOff = false
+    @AppStorage(IntelligencePreferences.messageTriageOffKey) private var messageTriageOff = false
 
     var body: some View {
         Form {
@@ -69,7 +70,13 @@ private struct GeneralSettings: View {
                     get: { !threadSummariesOff },
                     set: { threadSummariesOff = !$0 }
                 ))
-                .disabled(!ThreadSummarizer.isSupportedOnThisMac)
+                .disabled(!IntelligenceStatus.isSupportedOnThisMac)
+
+                Toggle("Flag messages that look like scams", isOn: Binding(
+                    get: { !messageTriageOff },
+                    set: { messageTriageOff = !$0 }
+                ))
+                .disabled(!IntelligenceStatus.isSupportedOnThisMac)
             } header: {
                 Text("Apple Intelligence")
             } footer: {
@@ -160,13 +167,13 @@ private struct GeneralSettings: View {
 
     /// What the Apple Intelligence section says under its toggle.
     private var intelligenceFooter: String {
-        let base = "Threads of \(ThreadSummarizer.minimumMessages) or more messages get a short summary at the top of the reader. It runs on this Mac — no part of a message is sent anywhere."
+        let base = "Threads of \(ThreadSummarizer.minimumMessages) or more messages get a short summary at the top of the reader. Scam flagging reads unfiled mail from senders you’ve never written to, and only ever suggests — it never files anything. Both run on this Mac; no part of a message is sent anywhere."
 
-        guard ThreadSummarizer.isSupportedOnThisMac else {
+        guard IntelligenceStatus.isSupportedOnThisMac else {
             return "This Mac doesn’t support Apple Intelligence, so thread summaries aren’t available."
         }
 
-        guard let advice = ThreadSummarizer.systemAdvice else {
+        guard let advice = IntelligenceStatus.currentAdvice else {
             return base
         }
 
@@ -424,16 +431,19 @@ private struct NotificationSettings: View {
 private struct AdvancedSettings: View {
     @ObservedObject var store: MailStore
     @AppStorage(IntelligencePreferences.threadSummariesOffKey) private var threadSummariesOff = false
+    @AppStorage(IntelligencePreferences.messageTriageOffKey) private var advancedTriageOff = false
     @State private var selfTestResult: String?
     @State private var isSelfTesting = false
 
     var body: some View {
         Form {
             Section {
-                LabeledContent("Model", value: ThreadSummarizer.availabilityDescription)
-                LabeledContent("Language", value: ThreadSummarizer.localeDescription)
-                LabeledContent("Context window", value: ThreadSummarizer.contextSizeDescription)
+                LabeledContent("Model", value: IntelligenceStatus.availabilityDescription)
+                LabeledContent("Language", value: IntelligenceStatus.localeDescription)
+                LabeledContent("Context window", value: IntelligenceStatus.contextSizeDescription)
                 LabeledContent("Thread summaries", value: threadSummariesOff ? "Off" : "On")
+                LabeledContent("Scam flagging", value: advancedTriageOff ? "Off" : "On")
+                LabeledContent("Known correspondents", value: "\(store.recipients.count) skipped")
                 LabeledContent("Minimum thread length", value: "\(ThreadSummarizer.minimumMessages) messages")
                 // The gate the reader actually hits: a thread has to be open
                 // and long enough before any of the above matters.

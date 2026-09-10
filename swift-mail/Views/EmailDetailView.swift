@@ -46,8 +46,10 @@ struct EmailDetailView: View {
     /// Owned by the reader rather than the store: it holds a model session and
     /// a per-thread cache, neither of which anything outside this pane wants.
     @StateObject private var summarizer = ThreadSummarizer()
+    @StateObject private var triager = MessageTriager()
     @AppStorage(IntelligencePreferences.threadSummariesOffKey) private var threadSummariesOff = false
     @AppStorage(SenderWarningPreferences.impersonationOffKey) private var impersonationWarningsOff = false
+    @AppStorage(IntelligencePreferences.messageTriageOffKey) private var messageTriageOff = false
 
     var body: some View {
         content
@@ -81,6 +83,15 @@ struct EmailDetailView: View {
         } else {
             ContentUnavailableView("No Message Selected", systemImage: "envelope.open")
         }
+    }
+
+    /// The model's verdict, but only when it is one worth interrupting for.
+    private var suspicion: MessageTriage? {
+        guard case .judged(let triage) = triager.state, triage.warrantsWarning else {
+            return nil
+        }
+
+        return triage
     }
 
     private func reader(for email: EmailDetail) -> some View {
@@ -131,8 +142,26 @@ struct EmailDetailView: View {
                 onReportPhishing: {
                     Task { await store.reportSpam(emailID: email.id, isPhishing: true) }
                 },
-                onDismissSenderWarning: { dismissesSenderWarning = true }
+                onDismissSenderWarning: { dismissesSenderWarning = true },
+                // Only when the deterministic check found nothing: a named
+                // brand mismatch is the stronger, checkable claim, and two
+                // warnings stacked on one message is one too many.
+                triage: impersonated == nil && !dismissesSenderWarning ? suspicion : nil,
+                onMoveToSpam: {
+                    Task { await store.reportSpam(emailID: email.id, isPhishing: false) }
+                }
             )
+            .task(id: email.id) {
+                guard !messageTriageOff else {
+                    return
+                }
+
+                triager.check(
+                    message: email,
+                    mailboxRole: store.selectedMailbox?.role,
+                    knownCorrespondents: store.recipients.map(\.email)
+                )
+            }
 
             Divider()
 
@@ -253,11 +282,13 @@ private struct ThreadSummaryView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            ForEach(points ?? [], id: \.self) { point in
+            // Filtered here rather than at the end of the stream, so a
+            // "nothing to report" line never appears even mid-generation.
+            ForEach(ThreadSummary.meaningful(points), id: \.self) { point in
                 line(point, systemImage: "circle.fill", tint: .secondary)
             }
 
-            ForEach(actions ?? [], id: \.self) { action in
+            ForEach(ThreadSummary.meaningful(actions), id: \.self) { action in
                 line(action, systemImage: "arrow.right.circle.fill", tint: .accentColor)
             }
         }
@@ -353,6 +384,8 @@ private struct ReaderHeader: View {
     var impersonatedBrand: SenderImpersonation.Brand?
     var onReportPhishing: () -> Void = {}
     var onDismissSenderWarning: () -> Void = {}
+    var triage: MessageTriage?
+    var onMoveToSpam: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
@@ -401,10 +434,17 @@ private struct ReaderHeader: View {
             }
 
             if let impersonatedBrand, let senderDomain {
-                SenderMismatchNotice(
-                    brand: impersonatedBrand,
-                    senderDomain: senderDomain,
-                    onReport: onReportPhishing,
+                AdvisoryNotice(
+                    text: "This message says it’s from \(impersonatedBrand.name), but it was sent from \(senderDomain).",
+                    actionTitle: "Report Phishing",
+                    action: onReportPhishing,
+                    onDismiss: onDismissSenderWarning
+                )
+            } else if let triage {
+                AdvisoryNotice(
+                    text: "Apple Intelligence thinks this may be a scam: \(triage.shortReason).",
+                    actionTitle: "Move to Spam",
+                    action: onMoveToSpam,
                     onDismiss: onDismissSenderWarning
                 )
             }
@@ -425,16 +465,16 @@ private struct ReaderHeader: View {
     }
 }
 
-/// States the mismatch and stops.
+/// Says what was noticed and stops.
 ///
-/// It names both halves — the brand the message claims and the domain it came
-/// from — because that sentence is checkable, where "this looks like phishing"
-/// is something the reader can only take on faith. The buttons are the two
-/// honest answers to it; nothing here moves the message on its own.
-private struct SenderMismatchNotice: View {
-    let brand: SenderImpersonation.Brand
-    let senderDomain: String
-    let onReport: () -> Void
+/// One shape for both warnings — the checkable brand mismatch and the model's
+/// read of a message — because they ask the reader the same question and
+/// deserve the same weight on screen. The buttons are the two honest answers;
+/// nothing here moves the message on its own.
+private struct AdvisoryNotice: View {
+    let text: String
+    let actionTitle: String
+    let action: () -> Void
     let onDismiss: () -> Void
 
     var body: some View {
@@ -445,23 +485,22 @@ private struct SenderMismatchNotice: View {
             // Same shape as the remote-content notice below, for the same
             // reason: a line limit bounds the height that `fixedSize` would
             // otherwise ask for next to a `Spacer`.
-            Text("This message says it’s from \(brand.name), but it was sent from \(senderDomain).")
+            Text(text)
                 .font(.callout)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
 
             Spacer(minLength: Theme.Spacing.sm)
 
-            Button("Not Phishing", action: onDismiss)
+            Button("Dismiss", action: onDismiss)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .help("Hide this warning for this message.")
 
-            Button("Report Phishing", action: onReport)
+            Button(actionTitle, action: action)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .tint(.orange)
-                .help("Mark as phishing and move to Spam.")
         }
         .padding(Theme.Spacing.md)
         .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: Theme.Radius.medium))

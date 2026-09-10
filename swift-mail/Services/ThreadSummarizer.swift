@@ -12,13 +12,71 @@ struct ThreadSummary: Equatable {
     @Guide(description: "What this thread is about, in one sentence")
     var gist: String
 
-    @Guide(description: "What was decided or settled, most important first")
+    @Guide(description: "What was decided or settled, most important first. Omit anything not actually settled.")
     @Guide(.maximumCount(4))
     var points: [String]
 
-    @Guide(description: "What the reader still needs to do. Empty if nothing is asked of them.")
+    @Guide(description: "Only things the reader must still do. Leave this empty when nothing is asked of them — never write that there is nothing.")
     @Guide(.maximumCount(3))
     var actions: [String]
+}
+
+extension ThreadSummary {
+    /// The entries worth showing: no "nothing to report" lines, no repeats.
+    ///
+    /// Both are things the model does that the guide asks it not to. Told to
+    /// leave a list empty it returned "No actions needed."; told to list what
+    /// the reader must do it listed one item twice, differing only by a full
+    /// stop. The guide asks; this enforces — and the dedupe is not merely
+    /// cosmetic, since `ForEach(id: \.self)` over repeated strings is
+    /// undefined.
+    static func meaningful(_ entries: [String]?) -> [String] {
+        var seen: Set<String> = []
+
+        return (entries ?? []).filter { entry in
+            let key = deduplicationKey(entry)
+
+            guard !key.isEmpty, !isNoOp(entry) else {
+                return false
+            }
+
+            return seen.insert(key).inserted
+        }
+    }
+
+    /// What makes two entries the same entry. Punctuation and case are the
+    /// model's phrasing, not its meaning.
+    static func deduplicationKey(_ entry: String) -> String {
+        entry
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: " \t\n.!?,;:-–—"))
+    }
+
+    /// Whether an entry is the model saying "nothing", rather than a thing.
+    ///
+    /// Deliberately narrow. It only fires on a short line that both opens with
+    /// a negation and names the absence — so "No need to reply to Ben" and
+    /// "Note the new 10am time" both survive, because a real action is longer
+    /// than a shrug and says something other than that it isn't one.
+    static func isNoOp(_ entry: String) -> Bool {
+        let text = entry
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: " \t\n.!-–—"))
+
+        guard text.count <= 60 else {
+            return false
+        }
+
+        if ["", "none", "nothing", "n/a", "na", "nil", "no action", "no actions"].contains(text) {
+            return true
+        }
+
+        let negates = ["no ", "none ", "nothing ", "not "].contains { text.hasPrefix($0) }
+        let namesTheAbsence = ["action", "further", "follow", "required", "needed", "to do", "outstanding", "response"]
+            .contains { text.contains($0) }
+
+        return negates && namesTheAbsence
+    }
 }
 
 /// Summarises a mail thread with the on-device model.
@@ -30,7 +88,7 @@ struct ThreadSummary: Equatable {
 final class ThreadSummarizer: ObservableObject {
     /// Below this a thread is short enough to read, and a summary is a slower,
     /// lossier version of the messages already on screen.
-    static let minimumMessages = 3
+    nonisolated static let minimumMessages = 3
 
     enum State: Equatable {
         case idle
@@ -63,59 +121,20 @@ final class ThreadSummarizer: ObservableObject {
 
     /// What Settings should say about the model, so the toggle can explain
     /// itself rather than sitting on next to a feature that silently can't run.
-    static var systemAdvice: String? {
-        advice(for: SystemLanguageModel.default.availability)
-    }
-
-    // MARK: - Diagnostics
-
-    /// The availability case, named rather than described, so the Advanced pane
-    /// reports what the framework actually said instead of a paraphrase.
-    static var availabilityDescription: String {
-        switch SystemLanguageModel.default.availability {
-        case .available: "Available"
-        case .unavailable(.appleIntelligenceNotEnabled): "Apple Intelligence is off"
-        case .unavailable(.deviceNotEligible): "This Mac isn’t eligible"
-        case .unavailable(.modelNotReady): "Model not ready (downloading)"
-        case .unavailable(let reason): "Unavailable (\(reason))"
-        }
-    }
-
-    /// Whether the model handles the language the Mac is set to. An
-    /// unsupported locale fails at generation time rather than at availability,
-    /// which is the kind of thing that reads as "it just doesn't work".
-    static var localeDescription: String {
-        let locale = Locale.current
-        let name = locale.localizedString(forIdentifier: locale.identifier) ?? locale.identifier
-
-        return SystemLanguageModel.default.supportsLocale(locale)
-            ? "\(name) — supported"
-            : "\(name) — not supported"
-    }
-
-    static var contextSizeDescription: String {
-        "\(SystemLanguageModel.default.contextSize) tokens"
-    }
+    // MARK: - Self test
 
     /// Runs the real path — same instructions, same `ThreadSummary` schema —
     /// against a fixed three-message thread, and says what came back.
     ///
-    /// This exists because every other line in the pane describes conditions,
-    /// and conditions looking right is not the same as the thing working. One
-    /// click turns "it never fires" into either a summary or a named error.
+    /// This exists because every other line in the Advanced pane describes
+    /// conditions, and conditions looking right is not the same as the thing
+    /// working. One click turns "it never fires" into a summary or a named
+    /// error.
     static func selfTest() async -> String {
-        guard let advice = advice(for: SystemLanguageModel.default.availability) else {
-            return await generateTestSummary()
+        guard IntelligenceStatus.isAvailable else {
+            return IntelligenceStatus.currentAdvice ?? "This Mac isn’t eligible for Apple Intelligence."
         }
 
-        guard case .unavailable(.deviceNotEligible) = SystemLanguageModel.default.availability else {
-            return advice
-        }
-
-        return "This Mac isn’t eligible for Apple Intelligence."
-    }
-
-    private static func generateTestSummary() async -> String {
         let sample = """
             Subject: Thursday review
             1. Ana, today: Can we move Thursday's review to Friday?
@@ -133,16 +152,8 @@ final class ThreadSummarizer: ObservableObject {
 
             return "Worked — “\(response.content.gist)”"
         } catch {
-            return message(for: error)
+            return IntelligenceStatus.message(for: error)
         }
-    }
-
-    static var isSupportedOnThisMac: Bool {
-        if case .unavailable(.deviceNotEligible) = SystemLanguageModel.default.availability {
-            return false
-        }
-
-        return true
     }
 
     /// Summarises `messages`, or explains why it can't.
@@ -172,7 +183,7 @@ final class ThreadSummarizer: ObservableObject {
         guard case .available = model.availability else {
             // No advice means nothing worth saying, so the pane stays silent
             // rather than carrying a notice the reader can't act on.
-            state = Self.advice(for: model.availability).map(State.unavailable) ?? .idle
+            state = IntelligenceStatus.advice(for: model.availability).map(State.unavailable) ?? .idle
             return
         }
 
@@ -241,7 +252,7 @@ final class ThreadSummarizer: ObservableObject {
             // A half-streamed summary is worse than none: it reads as a
             // complete answer that happens to be wrong.
             partial = nil
-            state = .failed(Self.message(for: error))
+            state = .failed(IntelligenceStatus.message(for: error))
             summarizedThreadID = nil
         }
     }
@@ -255,18 +266,20 @@ final class ThreadSummarizer: ObservableObject {
         You summarise email threads for the person who received them.
         Be specific and factual: name who said what, and never invent detail.
         Say only what the messages say.
+        Leave a list empty when it has nothing in it; never fill it with a note
+        saying there is nothing.
         """
 
     /// Hard ceiling on messages fed to the model, before token budgeting. The
     /// recent end of a long thread is what a reader needs catching up on.
-    static let maximumMessages = 20
+    nonisolated static let maximumMessages = 20
     /// Per-message character budget. Fastmail's `preview` runs to a couple of
     /// hundred characters, so this rarely truncates — it's the guard against
     /// one enormous message crowding out the rest of the thread.
-    static let maximumCharactersPerMessage = 400
+    nonisolated static let maximumCharactersPerMessage = 400
     /// Room set aside for the instructions, the `ThreadSummary` schema and the
     /// model's own answer.
-    static let reservedTokens = 1_200
+    nonisolated static let reservedTokens = 1_200
 
     /// The thread as text, newest messages retained, oldest dropped until it
     /// fits the context window.
@@ -329,49 +342,5 @@ final class ThreadSummarizer: ObservableObject {
 
             \(lines.joined(separator: "\n"))
             """
-    }
-
-    // MARK: - Availability and errors
-
-    /// What to tell the reader about the model being unusable, or nil when
-    /// there is nothing worth saying.
-    ///
-    /// A Mac that isn't eligible never will be, so a notice about it on every
-    /// long thread is a standing complaint about hardware rather than
-    /// something anyone can act on — that case says nothing and the summary
-    /// simply doesn't appear. The others are all temporary and fixable, which
-    /// is what makes them worth a line: without one, a reader who asked for
-    /// this feature would just see it missing.
-    nonisolated static func advice(for availability: SystemLanguageModel.Availability) -> String? {
-        switch availability {
-        case .available, .unavailable(.deviceNotEligible):
-            nil
-        case .unavailable(.appleIntelligenceNotEnabled):
-            "Turn on Apple Intelligence in System Settings to summarise threads."
-        case .unavailable(.modelNotReady):
-            "Apple Intelligence is still getting ready. Try again shortly."
-        case .unavailable:
-            "Apple Intelligence isn’t available right now."
-        }
-    }
-
-    /// Plain sentences, because the framework's own messages name types the
-    /// reader has no way to act on.
-    nonisolated static func message(for error: Error) -> String {
-        switch error {
-        case LanguageModelSession.GenerationError.exceededContextWindowSize:
-            "This thread is too long to summarise."
-        case LanguageModelSession.GenerationError.guardrailViolation,
-             LanguageModelSession.GenerationError.refusal:
-            "Apple Intelligence wouldn’t summarise this thread."
-        case LanguageModelSession.GenerationError.unsupportedLanguageOrLocale:
-            "Apple Intelligence doesn’t support this thread’s language yet."
-        case LanguageModelSession.GenerationError.rateLimited:
-            "Too many summaries at once. Try again in a moment."
-        case LanguageModelSession.GenerationError.assetsUnavailable:
-            "Apple Intelligence isn’t ready yet. Try again shortly."
-        default:
-            "Couldn’t summarise this thread."
-        }
     }
 }

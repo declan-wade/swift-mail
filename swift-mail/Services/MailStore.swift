@@ -66,9 +66,14 @@ nonisolated enum IntelligencePreferences {
     /// missing bool with `false`, and on is the default worth having, so the
     /// stored flag is the opt-out.
     static let threadSummariesOffKey = "swift-mail.intelligence.threadSummaries.off"
+    static let messageTriageOffKey = "swift-mail.intelligence.messageTriage.off"
 
     static var summarizesThreads: Bool {
         !UserDefaults.standard.bool(forKey: threadSummariesOffKey)
+    }
+
+    static var triagesMessages: Bool {
+        !UserDefaults.standard.bool(forKey: messageTriageOffKey)
     }
 }
 
