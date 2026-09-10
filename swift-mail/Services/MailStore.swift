@@ -60,6 +60,105 @@ nonisolated enum ThreadPreferences {
     }
 }
 
+/// Where saved attachments land.
+///
+/// The sandbox is the whole reason this isn't a stored path string: the app is
+/// entitled to `~/Downloads` outright, but reaching anywhere else needs the
+/// user to have picked the folder in an open panel and needs the
+/// security-scoped bookmark that picking produced to be resolved and started
+/// around every write. An unresolvable bookmark falls back to `~/Downloads`
+/// rather than failing the save.
+nonisolated enum DownloadPreferences {
+    static let bookmarkKey = "swift-mail.downloadFolder"
+
+    /// The name shown in labels and tooltips, from the stored bookmark. Kept
+    /// separate from `destination()` so a view can render the current choice
+    /// without starting access it isn't going to write through.
+    static func folderName(from bookmark: Data?) -> String {
+        guard let bookmark else {
+            return "Downloads"
+        }
+
+        var isStale = false
+        let url = try? URL(
+            resolvingBookmarkData: bookmark,
+            options: .withSecurityScope,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        )
+
+        return url?.lastPathComponent ?? "Downloads"
+    }
+
+    /// Where a save goes, and whether the write has to be wrapped in
+    /// security-scoped access. `~/Downloads` is entitled outright, so it must
+    /// not be balanced with a `stop` it never started.
+    static func destination() throws -> (url: URL, isScoped: Bool) {
+        if let chosen = resolvedFolder() {
+            return (chosen, true)
+        }
+
+        let downloads = try FileManager.default.url(
+            for: .downloadsDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+
+        return (downloads, false)
+    }
+
+    /// The chosen folder, or nil when saves should go to `~/Downloads`.
+    static func resolvedFolder(in defaults: UserDefaults = .standard) -> URL? {
+        guard let data = defaults.data(forKey: bookmarkKey) else {
+            return nil
+        }
+
+        var isStale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: data,
+            options: .withSecurityScope,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ) else {
+            // The folder is gone, or the bookmark no longer resolves. Dropping
+            // it puts saves back in ~/Downloads instead of failing every one.
+            defaults.removeObject(forKey: bookmarkKey)
+            return nil
+        }
+
+        // A stale bookmark still resolves once; it just won't keep resolving.
+        // Rewriting it now is what stops a moved folder quietly reverting to
+        // Downloads at some later launch.
+        if isStale {
+            let started = url.startAccessingSecurityScopedResource()
+            defer {
+                if started {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            try? setFolder(url, in: defaults)
+        }
+
+        return url
+    }
+
+    static func setFolder(_ url: URL, in defaults: UserDefaults = .standard) throws {
+        let data = try url.bookmarkData(
+            options: .withSecurityScope,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+
+        defaults.set(data, forKey: bookmarkKey)
+    }
+
+    static func useDefaultFolder(in defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: bookmarkKey)
+    }
+}
+
 /// How long the server holds a message before releasing it.
 ///
 /// Send later and undo send are the same mechanism — an `EmailSubmission` with
@@ -1888,18 +1987,22 @@ final class MailStore: ObservableObject {
         return file
     }
 
-    /// Saves an attachment into ~/Downloads, numbering the name if it is taken.
+    /// Saves an attachment into the chosen download folder, numbering the name
+    /// if it is taken.
     @discardableResult
-    func saveToDownloads(_ attachment: EmailAttachment) async throws -> URL {
+    func saveAttachment(_ attachment: EmailAttachment) async throws -> URL {
         let data = try await attachmentData(attachment)
-        let downloads = try FileManager.default.url(
-            for: .downloadsDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
+        let (directory, isScoped) = try DownloadPreferences.destination()
 
-        let file = Self.uniqueURL(in: downloads, named: Self.safeFileName(for: attachment))
+        // A bookmarked folder is writable only between start and stop.
+        let started = isScoped && directory.startAccessingSecurityScopedResource()
+        defer {
+            if started {
+                directory.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let file = Self.uniqueURL(in: directory, named: Self.safeFileName(for: attachment))
         try data.write(to: file)
 
         return file

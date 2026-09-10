@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// The Settings window, split the way macOS expects: a small number of
 /// noun-named tabs, each pane a grouped `Form` at a shared width so the window
@@ -49,6 +50,7 @@ private struct GeneralSettings: View {
     @AppStorage(ReadingPreferences.marksReadOnOpenKey) private var marksReadOnOpen = false
     @AppStorage(SwipePreferences.leadingKey) private var leadingSwipe = SwipePreferences.leadingDefault.rawValue
     @AppStorage(SwipePreferences.trailingKey) private var trailingSwipe = SwipePreferences.trailingDefault.rawValue
+    @AppStorage(DownloadPreferences.bookmarkKey) private var downloadBookmark: Data?
 
     var body: some View {
         Form {
@@ -78,6 +80,32 @@ private struct GeneralSettings: View {
             }
 
             Section {
+                LabeledContent("Save attachments to") {
+                    HStack(spacing: Theme.Spacing.sm) {
+                        Text(DownloadPreferences.folderName(from: downloadBookmark))
+                            .foregroundStyle(.secondary)
+
+                        Button("Choose\u{2026}", action: chooseDownloadFolder)
+
+                        // Only offered once it would do something: the sandbox
+                        // grants ~/Downloads outright, so going back to it is
+                        // dropping the bookmark rather than picking a folder.
+                        if downloadBookmark != nil {
+                            Button("Use Downloads") {
+                                DownloadPreferences.useDefaultFolder()
+                            }
+                        }
+                    }
+                }
+            } header: {
+                Text("Downloads")
+            } footer: {
+                Text("Anywhere outside Downloads has to be picked here once, so the app is granted access to it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 Picker("Swipe right", selection: $leadingSwipe) {
                     swipeOptions
                 }
@@ -93,7 +121,29 @@ private struct GeneralSettings: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .settingsPane(height: 430)
+        .settingsPane(height: 600)
+    }
+
+    /// The open panel is the grant: picking a folder is what lets the sandbox
+    /// write to it, and the bookmark is what makes that survive a relaunch.
+    private func chooseDownloadFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose where saved attachments go."
+        panel.directoryURL = DownloadPreferences.resolvedFolder() ?? .downloadsDirectory
+
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+
+        do {
+            try DownloadPreferences.setFolder(url)
+        } catch {
+            store.errorMessage = error.localizedDescription
+        }
     }
 
     @ViewBuilder

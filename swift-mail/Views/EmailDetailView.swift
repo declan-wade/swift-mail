@@ -329,6 +329,10 @@ private struct AttachmentList: View {
     /// documents — so there is no per-type preview code here.
     @State private var previewURL: URL?
     @State private var busyID: EmailAttachment.ID?
+    /// The attachment showing its "saved" tick, and the timer that clears it.
+    @State private var savedID: EmailAttachment.ID?
+    @State private var savedResetTask: Task<Void, Never>?
+    @AppStorage(DownloadPreferences.bookmarkKey) private var downloadBookmark: Data?
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
@@ -341,13 +345,37 @@ private struct AttachmentList: View {
                     AttachmentChip(
                         attachment: attachment,
                         isBusy: busyID == attachment.id,
+                        hasSaved: savedID == attachment.id,
+                        destinationName: DownloadPreferences.folderName(from: downloadBookmark),
                         onPreview: { run(attachment) { previewURL = try await store.previewFile(for: $0) } },
-                        onSave: { run(attachment) { try await store.saveToDownloads($0) } }
+                        onSave: {
+                            run(attachment) {
+                                try await store.saveAttachment($0)
+                                markSaved($0.id)
+                            }
+                        }
                     )
                 }
             }
         }
         .quickLookPreview($previewURL)
+        .onDisappear { savedResetTask?.cancel() }
+    }
+
+    /// The tick is the only confirmation a save gets — no alert, no Finder
+    /// window — so it stays long enough to be read and then gets out of the way
+    /// rather than becoming permanent chrome on the chip.
+    private func markSaved(_ id: EmailAttachment.ID) {
+        savedID = id
+        savedResetTask?.cancel()
+        savedResetTask = Task {
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else {
+                return
+            }
+
+            savedID = nil
+        }
     }
 
     /// Both actions download first, so they share the spinner and the alert.
@@ -369,14 +397,25 @@ private struct AttachmentList: View {
     }
 }
 
+/// Two targets in one chip: the name previews, the trailing segment saves.
+///
+/// The save used to be a bare glyph sitting in the chip's own padding, so its
+/// hit area was the size of the arrow itself. Here the chip carries no padding
+/// of its own — each half pads itself instead — which turns the padding into
+/// target for whichever half it belongs to, and a divider makes the boundary
+/// something you can aim at rather than guess.
 private struct AttachmentChip: View {
     let attachment: EmailAttachment
     let isBusy: Bool
+    let hasSaved: Bool
+    let destinationName: String
     let onPreview: () -> Void
     let onSave: () -> Void
 
+    @State private var isHoveringSave = false
+
     var body: some View {
-        HStack(spacing: Theme.Spacing.xs) {
+        HStack(spacing: 0) {
             Button(action: onPreview) {
                 HStack(spacing: Theme.Spacing.xs) {
                     Image(systemName: "doc")
@@ -387,27 +426,55 @@ private struct AttachmentChip: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                .padding(.leading, Theme.Spacing.sm)
+                .padding(.trailing, Theme.Spacing.xs)
+                .padding(.vertical, Theme.Spacing.xs)
+                .contentShape(.rect)
             }
             .buttonStyle(.plain)
             .help("Quick Look \(attachment.displayName)")
 
-            if isBusy {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Button(action: onSave) {
-                    Image(systemName: "arrow.down.circle")
+            Divider()
+                .frame(height: Self.saveTarget * 0.55)
+
+            Button(action: onSave) {
+                saveIcon
+                    .frame(width: Self.saveTarget, height: Self.saveTarget)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(hasSaved ? Color.green : Color.secondary)
+            .background(
+                isHoveringSave ? Color.primary.opacity(0.08) : .clear,
+                in: RoundedRectangle(cornerRadius: Theme.Radius.small)
+            )
+            .help(hasSaved ? "Saved to \(destinationName)" : "Save to \(destinationName)")
+            .onHover { hovering in
+                withAnimation(Theme.Motion.hover) {
+                    isHoveringSave = hovering
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Save to Downloads")
             }
         }
         .font(.callout)
-        .padding(.horizontal, Theme.Spacing.sm)
-        .padding(.vertical, Theme.Spacing.xs)
         .background(.quaternary, in: RoundedRectangle(cornerRadius: Theme.Radius.small))
         .disabled(isBusy)
+    }
+
+    /// Square, and wide enough to hit without aiming. The arrow is drawn a step
+    /// larger than the chip's text so the target reads as a control rather than
+    /// as punctuation after the filename.
+    private static let saveTarget: CGFloat = 26
+
+    @ViewBuilder
+    private var saveIcon: some View {
+        if isBusy {
+            ProgressView()
+                .controlSize(.small)
+        } else {
+            Image(systemName: hasSaved ? "checkmark.circle.fill" : "arrow.down.circle")
+                .imageScale(.large)
+                .contentTransition(.symbolEffect(.replace))
+        }
     }
 }
 
