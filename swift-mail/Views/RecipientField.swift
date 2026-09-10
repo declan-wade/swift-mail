@@ -107,8 +107,14 @@ struct RecipientField: NSViewRepresentable {
                     return
                 }
 
-                scrollView.automaticallyAdjustsContentInsets = false
-                scrollView.contentInsets = NSEdgeInsets(top: rowInset, left: 0, bottom: rowInset, right: 0)
+                // Written only when they actually differ. Setting either of
+                // these re-lays out the popup's table, and doing that on every
+                // keystroke made AppKit warn about reentrant work in its own
+                // table view delegate.
+                if scrollView.contentInsets.top != rowInset {
+                    scrollView.automaticallyAdjustsContentInsets = false
+                    scrollView.contentInsets = NSEdgeInsets(top: rowInset, left: 0, bottom: rowInset, right: 0)
+                }
 
                 // The insets have to come out of a taller window rather than
                 // out of the rows, or the list would overflow by exactly the
@@ -126,7 +132,11 @@ struct RecipientField: NSViewRepresentable {
                 // Measured after the resize, since AppKit clamps the frame to
                 // the screen: the scroller earns its place only if the list
                 // genuinely didn't fit.
-                scrollView.hasVerticalScroller = scrollView.contentSize.height < documentHeight
+                let needsScroller = scrollView.contentSize.height < documentHeight
+
+                if scrollView.hasVerticalScroller != needsScroller {
+                    scrollView.hasVerticalScroller = needsScroller
+                }
             }
         }
 

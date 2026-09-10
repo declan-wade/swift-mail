@@ -1,0 +1,861 @@
+diff --git b/.github/scripts/write_appcast.py a/.github/scripts/write_appcast.py
+new file mode 100755
+index 0000000..28a3736
+--- /dev/null
++++ a/.github/scripts/write_appcast.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""Insert (or replace) one release in the Sparkle appcast.
++
++Sparkle's own `generate_appcast` assumes every archive sits under one common
++URL prefix. GitHub Releases don't work that way — each asset lives under its
++own tag — so the item is written here instead, from the signature
++`sign_update` produced.
++
++Idempotent by version: re-running a release replaces its item rather than
++adding a second one for the same build.
++"""
++
++import argparse
++import re
++import xml.etree.ElementTree as ET
++from datetime import datetime, timezone
++
++SPARKLE_NS = "http://www.andymatuschak.org/xml-namespaces/sparkle"
++ET.register_namespace("sparkle", SPARKLE_NS)
++
++
++def enclosure_attributes(signature_output: str) -> dict[str, str]:
++    """Pull the attributes out of what `sign_update` prints.
++
++    It emits a ready-made XML fragment, e.g.
++        sparkle:edSignature="abc==" length="12345"
++    so the attributes are read off it rather than reconstructed.
++    """
++    attributes = dict(re.findall(r'([\w:]+)="([^"]*)"', signature_output))
++
++    if "sparkle:edSignature" not in attributes or "length" not in attributes:
++        raise SystemExit(f"sign_update output not understood: {signature_output!r}")
++
++    return attributes
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--appcast", required=True)
++    parser.add_argument("--signature", required=True, help="file holding sign_update's output")
++    parser.add_argument("--version", required=True, help="CFBundleVersion; what Sparkle compares")
++    parser.add_argument("--short-version", required=True)
++    parser.add_argument("--url", required=True)
++    parser.add_argument("--release-notes", required=True)
++    parser.add_argument("--minimum-system-version", required=True)
++    args = parser.parse_args()
++
++    with open(args.signature) as handle:
++        attributes = enclosure_attributes(handle.read())
++
++    tree = ET.parse(args.appcast)
++    channel = tree.getroot().find("channel")
++
++    if channel is None:
++        raise SystemExit(f"{args.appcast} has no <channel>")
++
++    for existing in channel.findall("item"):
++        if existing.findtext(f"{{{SPARKLE_NS}}}version") == args.version:
++            channel.remove(existing)
++
++    item = ET.Element("item")
++    ET.SubElement(item, "title").text = args.short_version
++    ET.SubElement(item, "pubDate").text = datetime.now(timezone.utc).strftime(
++        "%a, %d %b %Y %H:%M:%S +0000"
++    )
++    ET.SubElement(item, f"{{{SPARKLE_NS}}}version").text = args.version
++    ET.SubElement(item, f"{{{SPARKLE_NS}}}shortVersionString").text = args.short_version
++    ET.SubElement(item, f"{{{SPARKLE_NS}}}minimumSystemVersion").text = args.minimum_system_version
++    ET.SubElement(item, f"{{{SPARKLE_NS}}}releaseNotesLink").text = args.release_notes
++    ET.SubElement(
++        item,
++        "enclosure",
++        {
++            "url": args.url,
++            "type": "application/octet-stream",
++            "length": attributes["length"],
++            f"{{{SPARKLE_NS}}}edSignature": attributes["sparkle:edSignature"],
++        },
++    )
++
++    # Newest first, but still after the channel's own title and description:
++    # items lead the metadata otherwise, which is invalid RSS.
++    items = channel.findall("item")
++    position = list(channel).index(items[0]) if items else len(channel)
++    channel.insert(position, item)
++    ET.indent(tree, space="    ")
++    tree.write(args.appcast, encoding="utf-8", xml_declaration=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git b/.github/workflows/release.yml a/.github/workflows/release.yml
+index cd71e63..42cab20 100644
+--- b/.github/workflows/release.yml
++++ a/.github/workflows/release.yml
+@@ -1,23 +1,24 @@
+ name: Build and Release
+ 
+-# Builds the macOS app and attaches it to a GitHub Release.
++# Builds the macOS app, publishes it as a GitHub Release asset, and writes the
++# Sparkle appcast that tells installed copies an update exists.
+ #
+-# - Publishing a release (or pushing a `v*` tag, which auto-drafts one below)
+-#   triggers a build and uploads the .app, zipped, as a release asset.
+-# - `workflow_dispatch` lets you run the build on demand (e.g. to sanity-check
+-#   a branch); it uploads a build artifact instead of touching any release.
++# - Pushing a `v*` tag builds, creates the release, and publishes the update.
++# - Publishing a release by hand does the same for that release's tag.
++# - `workflow_dispatch` builds only, uploading a build artifact and touching
++#   neither the releases nor the appcast.
+ #
+-# This produces an UNSIGNED build (CODE_SIGNING_ALLOWED=NO) — CI has no access
+-# to your Developer ID certificate. Anyone downloading the zip will need to
+-# right-click → Open (or `xattr -cr`) past Gatekeeper the first time. To ship a
+-# signed, notarized build instead, add your certificate (base64 .p12) and an
+-# app-specific notarization password as repo secrets, import the cert in a
+-# step before `xcodebuild`, and run `xcodebuild -exportArchive` +
+-# `xcrun notarytool submit` — ask for that version if you want it wired up.
++# Signing, notarization and update-signing are each skipped when their secrets
++# are absent, so a fork with no secrets still gets the unsigned build this
++# workflow produced before Sparkle existed. See docs/UPDATES.md for the secrets
++# and for why an unsigned build cannot actually self-update.
+ 
+ on:
+   release:
+     types: [created]
++  push:
++    tags:
++      - "v*"
+   workflow_dispatch:
+ 
+ permissions:
+@@ -26,6 +27,7 @@ permissions:
+ env:
+   SCHEME: swift-mail
+   PROJECT: swift-mail.xcodeproj
++  SPARKLE_VERSION: 2.9.6
+ 
+ jobs:
+   build:
+@@ -43,7 +45,77 @@ jobs:
+           # (currently macOS 26.5 — see MACOSX_DEPLOYMENT_TARGET).
+           xcode-version: latest-stable
+ 
+-      - name: Build
++      - name: Work out what this run can do
++        id: caps
++        env:
++          CERT: ${{ secrets.MACOS_CERTIFICATE_P12 }}
++          NOTARY: ${{ secrets.NOTARY_APPLE_ID }}
++          SPARKLE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
++        run: |
++          set -euo pipefail
++          # Secrets can't be read in a step `if:`, so they are reduced to
++          # yes/no outputs here and every later step keys off these.
++          { echo "signed=$([ -n "$CERT" ] && echo true || echo false)"
++            echo "notarized=$([ -n "$NOTARY" ] && echo true || echo false)"
++            echo "publishes_update=$([ -n "$SPARKLE_KEY" ] && echo true || echo false)"
++          } >> "$GITHUB_OUTPUT"
++
++      - name: Work out the version
++        id: version
++        run: |
++          set -euo pipefail
++          # A tag push and a published release both name a tag; a manual run
++          # has none, and builds as 0.0.0 without going near a release.
++          TAG="${GITHUB_REF#refs/tags/}"
++          if [ "${{ github.event_name }}" = "release" ]; then
++            TAG="${{ github.event.release.tag_name }}"
++          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
++            TAG=""
++          fi
++
++          {
++            echo "tag=$TAG"
++            echo "marketing=$([ -n "$TAG" ] && echo "${TAG#v}" || echo "0.0.0")"
++            # Sparkle compares CFBundleVersion, so it has to increase on every
++            # release. The run number is the one number that always does.
++            echo "build=${{ github.run_number }}"
++          } >> "$GITHUB_OUTPUT"
++
++      - name: Import signing certificate
++        if: steps.caps.outputs.signed == 'true'
++        env:
++          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
++          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
++        run: |
++          set -euo pipefail
++          # A throwaway keychain, unlocked for this job only. The password is
++          # random because nothing outside this run ever needs to open it.
++          KEYCHAIN_PASSWORD=$(uuidgen)
++          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
++
++          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
++          security set-keychain-settings -lut 21600 "$KEYCHAIN"
++          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
++
++          echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
++          security import "$RUNNER_TEMP/certificate.p12" \
++            -k "$KEYCHAIN" \
++            -P "$CERTIFICATE_PASSWORD" \
++            -T /usr/bin/codesign
++          rm "$RUNNER_TEMP/certificate.p12"
++
++          # Without this, codesign prompts for keychain access and hangs the
++          # runner until it times out.
++          security set-key-partition-list \
++            -S apple-tool:,apple:,codesign: \
++            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
++
++          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
++
++      - name: Build (signed)
++        if: steps.caps.outputs.signed == 'true'
++        env:
++          TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+         run: |
+           set -euo pipefail
+           xcodebuild \
+@@ -52,49 +124,168 @@ jobs:
+             -configuration Release \
+             -derivedDataPath build \
+             -destination 'generic/platform=macOS' \
++            -archivePath "$RUNNER_TEMP/SwiftMail.xcarchive" \
++            MARKETING_VERSION="${{ steps.version.outputs.marketing }}" \
++            CURRENT_PROJECT_VERSION="${{ steps.version.outputs.build }}" \
++            DEVELOPMENT_TEAM="$TEAM_ID" \
++            CODE_SIGN_STYLE=Manual \
++            CODE_SIGN_IDENTITY="Developer ID Application" \
++            OTHER_CODE_SIGN_FLAGS="--timestamp -o runtime" \
++            archive
++
++          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
++          <?xml version="1.0" encoding="UTF-8"?>
++          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++          <plist version="1.0">
++          <dict>
++            <key>method</key><string>developer-id</string>
++            <key>teamID</key><string>$TEAM_ID</string>
++            <key>signingStyle</key><string>manual</string>
++            <key>destination</key><string>export</string>
++          </dict>
++          </plist>
++          PLIST
++
++          # exportArchive is what re-signs Sparkle's XPC services with this
++          # certificate; a plain `build` would leave them ad-hoc signed and the
++          # sandboxed installer would be refused at launch.
++          xcodebuild -exportArchive \
++            -archivePath "$RUNNER_TEMP/SwiftMail.xcarchive" \
++            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
++            -exportPath "$RUNNER_TEMP/export"
++
++          echo "APP=$RUNNER_TEMP/export/SwiftMail.app" >> "$GITHUB_ENV"
++
++      - name: Build (unsigned)
++        if: steps.caps.outputs.signed != 'true'
++        run: |
++          set -euo pipefail
++          xcodebuild \
++            -project "$PROJECT" \
++            -scheme "$SCHEME" \
++            -configuration Release \
++            -derivedDataPath build \
++            -destination 'generic/platform=macOS' \
++            MARKETING_VERSION="${{ steps.version.outputs.marketing }}" \
++            CURRENT_PROJECT_VERSION="${{ steps.version.outputs.build }}" \
+             CODE_SIGNING_ALLOWED=NO \
+             CODE_SIGNING_REQUIRED=NO \
+             build
+ 
++          echo "APP=$PWD/build/Build/Products/Release/SwiftMail.app" >> "$GITHUB_ENV"
++
+       - name: Zip app bundle
+         run: |
+           set -euo pipefail
+-          cd build/Build/Products/Release
+-          # The bundle is named after PRODUCT_NAME (SwiftMail), not the scheme
+-          # (swift-mail), so it is discovered rather than spelled out — a future
+-          # rename can't break this step. Two matches make ditto fail loudly.
+-          APP=$(ls -d *.app)
+-          # ditto (not plain zip) preserves the bundle structure and extended
+-          # attributes an .app relies on.
+-          ditto -c -k --sequesterRsrc --keepParent "$APP" "$GITHUB_WORKSPACE/${APP%.app}-macos.zip"
+-          echo "ZIP=${APP%.app}-macos.zip" >> "$GITHUB_ENV"
++          # ditto (not plain zip) preserves the bundle structure, symlinks and
++          # extended attributes an .app — and Sparkle.framework inside it —
++          # relies on.
++          ditto -c -k --sequesterRsrc --keepParent "$APP" "$GITHUB_WORKSPACE/SwiftMail-macos.zip"
++          echo "ZIP=$GITHUB_WORKSPACE/SwiftMail-macos.zip" >> "$GITHUB_ENV"
++
++      - name: Notarize and staple
++        if: steps.caps.outputs.signed == 'true' && steps.caps.outputs.notarized == 'true'
++        env:
++          APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
++          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
++          TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
++        run: |
++          set -euo pipefail
++          xcrun notarytool submit "$ZIP" \
++            --apple-id "$APPLE_ID" \
++            --password "$NOTARY_PASSWORD" \
++            --team-id "$TEAM_ID" \
++            --wait
++
++          # The ticket is stapled to the app, not to the archive, so the zip
++          # has to be rebuilt around the stapled bundle for offline launches.
++          xcrun stapler staple "$APP"
++          rm "$ZIP"
++          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+ 
+       - name: Upload build artifact
++        if: github.event_name == 'workflow_dispatch'
+         uses: actions/upload-artifact@v4
+         with:
+-          name: ${{ env.ZIP }}
++          name: SwiftMail-macos
+           path: ${{ env.ZIP }}
+ 
++      - name: Create release for tag push
++        if: github.event_name == 'push'
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: |
++          set -euo pipefail
++          gh release create "${{ steps.version.outputs.tag }}" \
++            "$ZIP" \
++            --repo "${{ github.repository }}" \
++            --title "${{ steps.version.outputs.tag }}" \
++            --generate-notes
++
+       - name: Attach to release
+         if: github.event_name == 'release'
+         env:
+           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+         run: |
+           set -euo pipefail
+-          gh release upload "${{ github.event.release.tag_name }}" \
++          gh release upload "${{ steps.version.outputs.tag }}" \
+             "$ZIP" \
+             --clobber \
+             --repo "${{ github.repository }}"
+ 
+-      - name: Create release for tag push
+-        if: github.event_name == 'push'
++      - name: Sign the update and write the appcast
++        if: github.event_name != 'workflow_dispatch' && steps.caps.outputs.publishes_update == 'true'
+         env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
++          TAG: ${{ steps.version.outputs.tag }}
++          MARKETING: ${{ steps.version.outputs.marketing }}
++          BUILD: ${{ steps.version.outputs.build }}
+         run: |
+           set -euo pipefail
+-          TAG="${GITHUB_REF#refs/tags/}"
+-          gh release create "$TAG" \
+-            "$ZIP" \
+-            --repo "${{ github.repository }}" \
+-            --title "$TAG" \
+-            --generate-notes
++          curl -fsSL -o "$RUNNER_TEMP/sparkle.tar.xz" \
++            "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz"
++          mkdir -p "$RUNNER_TEMP/sparkle"
++          tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
++
++          SIGN=$(find "$RUNNER_TEMP/sparkle" -name sign_update -type f | head -1)
++
++          # A tag build sits on a detached head, so the appcast is taken from
++          # main and edited there — the tag's own copy is whatever main held
++          # when the tag was cut, which is one release behind by definition.
++          git fetch --depth=1 origin main
++          git show FETCH_HEAD:appcast.xml > "$RUNNER_TEMP/appcast.xml"
++
++          # sign_update prints the enclosure's attributes; the appcast writer
++          # below wants them as-is.
++          "$SIGN" -s "$SPARKLE_PRIVATE_KEY" "$ZIP" > "$RUNNER_TEMP/signature.txt"
++          cat "$RUNNER_TEMP/signature.txt"
++
++          python3 .github/scripts/write_appcast.py \
++            --appcast "$RUNNER_TEMP/appcast.xml" \
++            --signature "$RUNNER_TEMP/signature.txt" \
++            --version "$BUILD" \
++            --short-version "$MARKETING" \
++            --url "https://github.com/${{ github.repository }}/releases/download/$TAG/SwiftMail-macos.zip" \
++            --release-notes "https://github.com/${{ github.repository }}/releases/tag/$TAG" \
++            --minimum-system-version "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP/Contents/Info.plist")"
++
++      - name: Commit the appcast
++        if: github.event_name != 'workflow_dispatch' && steps.caps.outputs.publishes_update == 'true'
++        run: |
++          set -euo pipefail
++          # The app's feed URL points at this file on main, so publishing the
++          # update *is* this commit.
++          git fetch --depth=1 origin main
++          git checkout -B main FETCH_HEAD
++          cp "$RUNNER_TEMP/appcast.xml" appcast.xml
++
++          if git diff --quiet appcast.xml; then
++            echo "appcast unchanged"
++            exit 0
++          fi
++
++          git config user.name "github-actions[bot]"
++          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
++          git add appcast.xml
++          git commit -m "Publish ${{ steps.version.outputs.tag }} to the appcast"
++          git push origin main
+diff --git b/README.md a/README.md
+index 355f1ba..0da4592 100644
+--- b/README.md
++++ a/README.md
+@@ -34,13 +34,21 @@ was optimised for. Nobody profiled memory here; there simply isn't a runtime.
+ 
+ ## Dependencies
+ 
+-**Zero third-party packages.** No SPM dependencies, no CocoaPods, no vendored
+-source. The entire dependency list is Apple's:
++**One third-party package.** No CocoaPods, no vendored source, and one SPM
++dependency: [Sparkle](https://sparkle-project.org), which updates the app. The
++rest of the list is Apple's:
+ 
+ `SwiftUI` · `AppKit` · `Foundation` · `Combine` · `SQLite3` · `WebKit` ·
+ `QuickLook` · `UserNotifications` · `CryptoKit` · `Security` ·
+ `UniformTypeIdentifiers` · `FoundationModels`
+ 
++Sparkle is the exception that proves the rule below. Shipping updates outside
++the App Store means signature verification, a sandboxed installer running as a
++separate XPC service, and an atomic swap of a running bundle — a security
++boundary where being wrong is expensive, and where fifteen years of other
++people finding the edges is worth more than anything written here in a week.
++See [docs/UPDATES.md](docs/UPDATES.md).
++
+ This is a deliberate constraint, and it shapes the code more than any other
+ decision:
+ 
+diff --git b/appcast.xml a/appcast.xml
+new file mode 100644
+index 0000000..d1adef7
+--- /dev/null
++++ a/appcast.xml
+@@ -0,0 +1,13 @@
++<?xml version="1.0" encoding="utf-8"?>
++<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
++    <channel>
++        <title>SwiftMail</title>
++        <link>https://raw.githubusercontent.com/declan-wade/swift-mail/main/appcast.xml</link>
++        <description>Updates for SwiftMail</description>
++        <language>en</language>
++        <!-- Items are written by .github/workflows/release.yml, newest first.
++             An empty channel is a valid feed: Sparkle reads it as "no update
++             available" rather than as an error, so the app behaves correctly
++             before the first release exists. -->
++    </channel>
++</rss>
+diff --git b/docs/UPDATES.md a/docs/UPDATES.md
+new file mode 100644
+index 0000000..620ea48
+--- /dev/null
++++ a/docs/UPDATES.md
+@@ -0,0 +1,75 @@
++# Updates (Sparkle)
++
++SwiftMail updates itself with [Sparkle 2](https://sparkle-project.org). The app
++checks `appcast.xml` in this repository, downloads the release archive from
++GitHub Releases, and verifies an EdDSA signature before installing anything.
++
++The app is sandboxed, so Sparkle installs through its `Installer.xpc` service.
++That is what `SUEnableInstallerLauncherService` in `swift-mail/Info.plist` and
++the `mach-lookup.global-name` exception in `swift_mail.entitlements` are for —
++remove either and updates download but never install.
++
++## One-time setup
++
++Updates stay disabled until the app carries a public key. `SoftwareUpdate`
++checks for one at launch and simply doesn't start the updater without it, so a
++key-less build has a greyed-out "Check for Updates…" rather than an error.
++
++1. Fetch Sparkle's tools (they are not part of the app build):
++
++```bash
++curl -fsSL -o /tmp/sparkle.tar.xz https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-2.9.6.tar.xz && mkdir -p /tmp/sparkle && tar -xf /tmp/sparkle.tar.xz -C /tmp/sparkle
++```
++
++2. Generate the key pair. The private key goes into your login Keychain; the
++   public key is printed:
++
++```bash
++/tmp/sparkle/bin/generate_keys
++```
++
++3. Paste the printed public key into `SUPublicEDKey` in
++   `swift-mail/Info.plist`, and commit it. It is meant to be public.
++
++4. Export the private key and add it to the repository as the
++   `SPARKLE_PRIVATE_KEY` secret. Anyone holding it can sign an update this app
++   will trust, so it never belongs in the repository:
++
++```bash
++/tmp/sparkle/bin/generate_keys -x -   # prints the private key to stdout
++```
++
++## Repository secrets
++
++| Secret | Required | What it does |
++| --- | --- | --- |
++| `SPARKLE_PRIVATE_KEY` | for updates | Signs the release archive. Without it the workflow still builds and publishes, but writes no appcast entry, so nobody is offered the update. |
++| `MACOS_CERTIFICATE_P12` | for signed builds | Base64 of your Developer ID Application certificate (`base64 -i cert.p12`). |
++| `MACOS_CERTIFICATE_PASSWORD` | with the above | The `.p12` export password. |
++| `MACOS_TEAM_ID` | with the above | Ten-character Apple team identifier. |
++| `NOTARY_APPLE_ID` | for notarization | Apple ID used with `notarytool`. |
++| `NOTARY_PASSWORD` | with the above | App-specific password for that Apple ID. |
++
++Without the signing secrets the workflow falls back to the unsigned build it
++made before. An unsigned build is fine for trying the app out, but Sparkle
++cannot meaningfully update one: macOS refuses to launch an unsigned replacement
++that arrives from the internet, and the sandbox entitlements above are only
++applied to a signed bundle.
++
++## Cutting a release
++
++Push a tag:
++
++```bash
++git tag v1.1.0 && git push origin v1.1.0
++```
++
++The workflow then builds, signs and notarizes if the secrets are present,
++attaches `SwiftMail-macos.zip` to the release, signs the archive with the
++Sparkle key, and commits the new `appcast.xml` entry to `main`.
++
++Versions come from the tag and the run number: `MARKETING_VERSION` is the tag
++without its leading `v` (what people see), and `CURRENT_PROJECT_VERSION` is the
++workflow run number (what Sparkle compares). The run number only ever goes up,
++which is the property Sparkle needs and the one a hand-edited build number
++tends to lose.
+diff --git b/swift-mail.xcodeproj/project.pbxproj a/swift-mail.xcodeproj/project.pbxproj
+index 6c0ca9a..79cd2ed 100644
+--- b/swift-mail.xcodeproj/project.pbxproj
++++ a/swift-mail.xcodeproj/project.pbxproj
+@@ -6,6 +6,10 @@
+ 	objectVersion = 77;
+ 	objects = {
+ 
++/* Begin PBXBuildFile section */
++		5A59A54E00000000000000A3 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 5A59A54E00000000000000A2 /* Sparkle */; };
++/* End PBXBuildFile section */
++
+ /* Begin PBXContainerItemProxy section */
+ 		CD91DFBA5CBF46DD8CE360D6 /* PBXContainerItemProxy */ = {
+ 			isa = PBXContainerItemProxy;
+@@ -39,6 +43,7 @@
+ 			isa = PBXFrameworksBuildPhase;
+ 			buildActionMask = 2147483647;
+ 			files = (
++				5A59A54E00000000000000A3 /* Sparkle in Frameworks */,
+ 			);
+ 			runOnlyForDeploymentPostprocessing = 0;
+ 		};
+@@ -90,6 +95,7 @@
+ 			);
+ 			name = "swift-mail";
+ 			packageProductDependencies = (
++				5A59A54E00000000000000A2 /* Sparkle */,
+ 			);
+ 			productName = "swift-mail";
+ 			productReference = 12FB94962FCFB54000763959 /* swift-mail.app */;
+@@ -146,6 +152,9 @@
+ 			);
+ 			mainGroup = 12FB948D2FCFB54000763959;
+ 			minimizedProjectReferenceProxies = 1;
++			packageReferences = (
++				5A59A54E00000000000000A1 /* XCRemoteSwiftPackageReference "Sparkle" */,
++			);
+ 			preferredProjectObjectVersion = 77;
+ 			productRefGroup = 12FB94972FCFB54000763959 /* Products */;
+ 			projectDirPath = "";
+@@ -335,6 +344,7 @@
+ 				ENABLE_PREVIEWS = YES;
+ 				ENABLE_USER_SELECTED_FILES = readonly;
+ 				GENERATE_INFOPLIST_FILE = YES;
++				INFOPLIST_FILE = "swift-mail/Info.plist";
+ 				INFOPLIST_KEY_CFBundleDisplayName = SwiftMail;
+ 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+ 				LD_RUNPATH_SEARCH_PATHS = (
+@@ -370,6 +380,7 @@
+ 				ENABLE_PREVIEWS = YES;
+ 				ENABLE_USER_SELECTED_FILES = readonly;
+ 				GENERATE_INFOPLIST_FILE = YES;
++				INFOPLIST_FILE = "swift-mail/Info.plist";
+ 				INFOPLIST_KEY_CFBundleDisplayName = SwiftMail;
+ 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+ 				LD_RUNPATH_SEARCH_PATHS = (
+@@ -455,6 +466,25 @@
+ 			defaultConfigurationName = Release;
+ 		};
+ /* End XCConfigurationList section */
++
++/* Begin XCRemoteSwiftPackageReference section */
++		5A59A54E00000000000000A1 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
++			isa = XCRemoteSwiftPackageReference;
++			repositoryURL = "https://github.com/sparkle-project/Sparkle";
++			requirement = {
++				kind = upToNextMajorVersion;
++				minimumVersion = 2.9.6;
++			};
++		};
++/* End XCRemoteSwiftPackageReference section */
++
++/* Begin XCSwiftPackageProductDependency section */
++		5A59A54E00000000000000A2 /* Sparkle */ = {
++			isa = XCSwiftPackageProductDependency;
++			package = 5A59A54E00000000000000A1 /* XCRemoteSwiftPackageReference "Sparkle" */;
++			productName = Sparkle;
++		};
++/* End XCSwiftPackageProductDependency section */
+ 	};
+ 	rootObject = 12FB948E2FCFB54000763959 /* Project object */;
+ }
+diff --git b/swift-mail.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved a/swift-mail.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+new file mode 100644
+index 0000000..5ed508c
+--- /dev/null
++++ a/swift-mail.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+@@ -0,0 +1,15 @@
++{
++  "originHash" : "e721da7f9826abdffcb6185e886155efa2514bd6234475f1afa893e29eb258d6",
++  "pins" : [
++    {
++      "identity" : "sparkle",
++      "kind" : "remoteSourceControl",
++      "location" : "https://github.com/sparkle-project/Sparkle",
++      "state" : {
++        "revision" : "ac2def288cbff5cfc7df3ffef6abdf45b72bcb0a",
++        "version" : "2.9.6"
++      }
++    }
++  ],
++  "version" : 3
++}
+diff --git b/swift-mail/Info.plist a/swift-mail/Info.plist
+new file mode 100644
+index 0000000..68df5d9
+--- /dev/null
++++ a/swift-mail/Info.plist
+@@ -0,0 +1,27 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<!-- Sparkle only. Everything else is still generated by Xcode
++	     (GENERATE_INFOPLIST_FILE stays YES) and merged into this file: custom
++	     keys like these are the one thing INFOPLIST_KEY_* build settings can't
++	     carry, since Xcode honours only a fixed allowlist of names. -->
++	<key>SUFeedURL</key>
++	<string>https://raw.githubusercontent.com/declan-wade/swift-mail/main/appcast.xml</string>
++	<!-- Replaced by `generate_keys` output; see docs/UPDATES.md. Until it holds
++	     a real key Sparkle refuses every update, which is the safe direction to
++	     fail in. -->
++	<key>SUPublicEDKey</key>
++	<string></string>
++	<!-- Sandboxed apps install updates through Sparkle's Installer XPC service;
++	     without this the updater can download but never install. -->
++	<key>SUEnableInstallerLauncherService</key>
++	<true/>
++	<!-- The app has com.apple.security.network.client, so Sparkle downloads
++	     in-process and the Downloader XPC service isn't needed. -->
++	<key>SUEnableAutomaticChecks</key>
++	<true/>
++	<key>SUScheduledCheckInterval</key>
++	<integer>86400</integer>
++</dict>
++</plist>
+diff --git b/swift-mail/Services/SoftwareUpdate.swift a/swift-mail/Services/SoftwareUpdate.swift
+new file mode 100644
+index 0000000..e139eeb
+--- /dev/null
++++ a/swift-mail/Services/SoftwareUpdate.swift
+@@ -0,0 +1,92 @@
++import Combine
++import Sparkle
++import SwiftUI
++
++/// Sparkle, wired for this app.
++///
++/// The updater is started only when the bundle actually carries a public key.
++/// Sparkle refuses to run without one and reports that as an error alert at
++/// launch, which is not what a build made before `generate_keys` has been run
++/// should greet you with — see `docs/UPDATES.md`. Without a key the app simply
++/// has no update feature, and the menu item says so by being disabled.
++@MainActor
++final class SoftwareUpdate: ObservableObject {
++    /// One updater for the process: Sparkle schedules its own checks, and a
++    /// second instance would schedule a second set.
++    static let shared = SoftwareUpdate()
++
++    /// Nil when the bundle has no public key. Everything else reads as "updates
++    /// unavailable" from that one fact.
++    private let controller: SPUStandardUpdaterController?
++
++    /// False while an update check is already running, and whenever there is no
++    /// updater at all.
++    @Published private(set) var canCheckForUpdates = false
++
++    /// Whether this build can update at all — see the note above about keys.
++    var isAvailable: Bool { controller != nil }
++
++    /// Sparkle owns the storage for both of these (its own `UserDefaults`
++    /// keys), so they are read straight back from it rather than mirrored.
++    /// `objectWillChange` on write is what keeps the toggles in step, since
++    /// Sparkle publishes nothing itself.
++    var checksAutomatically: Bool {
++        get { controller?.updater.automaticallyChecksForUpdates ?? false }
++        set {
++            objectWillChange.send()
++            controller?.updater.automaticallyChecksForUpdates = newValue
++        }
++    }
++
++    var downloadsAutomatically: Bool {
++        get { controller?.updater.automaticallyDownloadsUpdates ?? false }
++        set {
++            objectWillChange.send()
++            controller?.updater.automaticallyDownloadsUpdates = newValue
++        }
++    }
++
++    private init() {
++        let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String
++
++        guard let key, !key.isEmpty else {
++            controller = nil
++            return
++        }
++
++        let controller = SPUStandardUpdaterController(
++            startingUpdater: true,
++            updaterDelegate: nil,
++            userDriverDelegate: nil
++        )
++
++        self.controller = controller
++        controller.updater.publisher(for: \.canCheckForUpdates).assign(to: &$canCheckForUpdates)
++    }
++
++    /// "1.0 (12)" — the marketing version people talk about, with the build
++    /// number Sparkle actually compares.
++    static var versionDescription: String {
++        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
++        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
++
++        return "\(short) (\(build))"
++    }
++
++    func checkForUpdates() {
++        controller?.checkForUpdates(nil)
++    }
++}
++
++/// The App menu's "Check for Updates…", which macOS apps put directly under
++/// About.
++struct CheckForUpdatesButton: View {
++    @ObservedObject private var update = SoftwareUpdate.shared
++
++    var body: some View {
++        Button("Check for Updates\u{2026}") {
++            update.checkForUpdates()
++        }
++        .disabled(!update.canCheckForUpdates)
++    }
++}
+diff --git b/swift-mail/Views/SettingsView.swift a/swift-mail/Views/SettingsView.swift
+index 55bbea3..b212ff5 100644
+--- b/swift-mail/Views/SettingsView.swift
++++ a/swift-mail/Views/SettingsView.swift
+@@ -55,6 +55,9 @@ private struct GeneralSettings: View {
+     @AppStorage(SenderWarningPreferences.impersonationOffKey) private var impersonationWarningsOff = false
+     @AppStorage(IntelligencePreferences.messageTriageOffKey) private var messageTriageOff = false
+     @AppStorage(ComposePreferences.inlineKey) private var composesInline = false
++    /// The updater is a singleton — Sparkle schedules its own checks — so this
++    /// observes it rather than owning it.
++    @ObservedObject private var softwareUpdate = SoftwareUpdate.shared
+ 
+     var body: some View {
+         Form {
+@@ -104,6 +107,35 @@ private struct GeneralSettings: View {
+                     .fixedSize(horizontal: false, vertical: true)
+             }
+ 
++            Section {
++                Toggle("Check for updates automatically", isOn: $softwareUpdate.checksAutomatically)
++                    .disabled(!softwareUpdate.isAvailable)
++
++                Toggle("Download updates in the background", isOn: $softwareUpdate.downloadsAutomatically)
++                    .disabled(!softwareUpdate.checksAutomatically)
++
++                LabeledContent("Version") {
++                    HStack(spacing: Theme.Spacing.sm) {
++                        Text(SoftwareUpdate.versionDescription)
++                            .foregroundStyle(.secondary)
++
++                        Button("Check Now") {
++                            softwareUpdate.checkForUpdates()
++                        }
++                        .disabled(!softwareUpdate.canCheckForUpdates)
++                    }
++                }
++            } header: {
++                Text("Software Update")
++            } footer: {
++                Text(!softwareUpdate.isAvailable
++                     ? "This build carries no update key, so it can't check for updates. Builds published through the release workflow can."
++                     : "Updates are downloaded from the project's GitHub releases and verified against the key built into this app before anything is installed.")
++                    .font(.caption)
++                    .foregroundStyle(.secondary)
++                    .fixedSize(horizontal: false, vertical: true)
++            }
++
+             Section {
+                 Picker("New messages open", selection: $composesInline) {
+                     Text("In a separate window").tag(false)
+diff --git b/swift-mail/swift_mail.entitlements a/swift-mail/swift_mail.entitlements
+index 27901f3..93cdc07 100644
+--- b/swift-mail/swift_mail.entitlements
++++ a/swift-mail/swift_mail.entitlements
+@@ -12,5 +12,14 @@
+ 	<true/>
+ 	<key>com.apple.security.files.bookmarks.app-scope</key>
+ 	<true/>
++	<!-- Sparkle's installer runs outside the sandbox, in an XPC service the app
++	     launches by name. A sandboxed app can only reach it through this
++	     exception; without it updates download and then fail to install. The
++	     two names are Sparkle's own, derived from the bundle id. -->
++	<key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
++	<array>
++		<string>$(PRODUCT_BUNDLE_IDENTIFIER)-spks</string>
++		<string>$(PRODUCT_BUNDLE_IDENTIFIER)-spki</string>
++	</array>
+ </dict>
+ </plist>
+diff --git b/swift-mail/swift_mailApp.swift a/swift-mail/swift_mailApp.swift
+index 1d5f8f9..724fd3e 100644
+--- b/swift-mail/swift_mailApp.swift
++++ a/swift-mail/swift_mailApp.swift
+@@ -25,6 +25,10 @@ struct swift_mailApp: App {
+         .commands {
+             ComposeCommands(store: store)
+             ViewCommands(store: store)
++
++            CommandGroup(after: .appInfo) {
++                CheckForUpdatesButton()
++            }
+         }
+ 
+         WindowGroup(id: ComposeWindow.id, for: ComposeDraft.self) { $draft in
