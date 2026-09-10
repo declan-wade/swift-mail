@@ -37,6 +37,11 @@ struct EmailDetailView: View {
     @ObservedObject var store: MailStore
     /// Per-message: remote images stay blocked until the reader asks for them.
     @State private var loadsRemoteContent = false
+    /// Per-message, like the remote-content block: a warning the reader has
+    /// looked at and disagreed with shouldn't keep shouting, but it also
+    /// shouldn't teach the app that the domain is fine — the next message
+    /// claiming the same brand is a fresh question.
+    @State private var dismissesSenderWarning = false
     @AppStorage(SafeSenders.storageKey) private var safeSenderDomains = ""
 
     var body: some View {
@@ -44,6 +49,7 @@ struct EmailDetailView: View {
             .navigationSplitViewColumnWidth(min: Theme.Column.detail.min, ideal: Theme.Column.detail.ideal)
             .onChange(of: store.selectedEmailID) { _, _ in
                 loadsRemoteContent = false
+                dismissesSenderWarning = false
             }
     }
 
@@ -76,6 +82,15 @@ struct EmailDetailView: View {
         let domain = SafeSenders.domain(of: email.from?.first?.email)
         let loadsRemote = loadsRemoteContent
             || (domain.map { SafeSenders.contains($0, in: safeSenderDomains) } ?? false)
+        // Safe Senders deliberately doesn't silence this. Trusting a domain
+        // with remote images is a statement about tracking pixels, not about
+        // whether the sender is who the name says.
+        let impersonated = dismissesSenderWarning
+            ? nil
+            : SenderImpersonation.impersonatedBrand(
+                displayName: email.from?.first?.name,
+                address: email.from?.first?.email
+            )
 
         return VStack(spacing: 0) {
             if store.conversation.count > 1 {
@@ -89,7 +104,12 @@ struct EmailDetailView: View {
                 showsRemoteContentNotice: email.htmlBodyLoadsRemoteContent && !loadsRemote,
                 onLoadRemoteContent: { loadsRemoteContent = true },
                 senderDomain: domain,
-                onTrustSenderDomain: { safeSenderDomains = SafeSenders.adding($0, to: safeSenderDomains) }
+                onTrustSenderDomain: { safeSenderDomains = SafeSenders.adding($0, to: safeSenderDomains) },
+                impersonatedBrand: impersonated,
+                onReportPhishing: {
+                    Task { await store.reportSpam(emailID: email.id, isPhishing: true) }
+                },
+                onDismissSenderWarning: { dismissesSenderWarning = true }
             )
 
             Divider()
@@ -212,6 +232,9 @@ private struct ReaderHeader: View {
     var onLoadRemoteContent: () -> Void = {}
     var senderDomain: String?
     var onTrustSenderDomain: (String) -> Void = { _ in }
+    var impersonatedBrand: SenderImpersonation.Brand?
+    var onReportPhishing: () -> Void = {}
+    var onDismissSenderWarning: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
@@ -259,6 +282,15 @@ private struct ReaderHeader: View {
                 AttachmentList(attachments: email.listedAttachments, store: store)
             }
 
+            if let impersonatedBrand, let senderDomain {
+                SenderMismatchNotice(
+                    brand: impersonatedBrand,
+                    senderDomain: senderDomain,
+                    onReport: onReportPhishing,
+                    onDismiss: onDismissSenderWarning
+                )
+            }
+
             if showsRemoteContentNotice {
                 RemoteContentNotice(
                     action: onLoadRemoteContent,
@@ -272,6 +304,53 @@ private struct ReaderHeader: View {
         .padding(.bottom, Theme.Spacing.xl)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.bar)
+    }
+}
+
+/// States the mismatch and stops.
+///
+/// It names both halves — the brand the message claims and the domain it came
+/// from — because that sentence is checkable, where "this looks like phishing"
+/// is something the reader can only take on faith. The buttons are the two
+/// honest answers to it; nothing here moves the message on its own.
+private struct SenderMismatchNotice: View {
+    let brand: SenderImpersonation.Brand
+    let senderDomain: String
+    let onReport: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            Image(systemName: "exclamationmark.shield")
+                .foregroundStyle(.orange)
+
+            // Same shape as the remote-content notice below, for the same
+            // reason: a line limit bounds the height that `fixedSize` would
+            // otherwise ask for next to a `Spacer`.
+            Text("This message says it’s from \(brand.name), but it was sent from \(senderDomain).")
+                .font(.callout)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: Theme.Spacing.sm)
+
+            Button("Not Phishing", action: onDismiss)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Hide this warning for this message.")
+
+            Button("Report Phishing", action: onReport)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(.orange)
+                .help("Mark as phishing and move to Spam.")
+        }
+        .padding(Theme.Spacing.md)
+        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: Theme.Radius.medium))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.Radius.medium)
+                .strokeBorder(.orange.opacity(0.35))
+        )
     }
 }
 
