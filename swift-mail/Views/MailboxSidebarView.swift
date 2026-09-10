@@ -74,7 +74,10 @@ private struct TagFilterBar: View {
             .padding(.horizontal, Theme.Spacing.md)
             .padding(.vertical, Theme.Spacing.sm)
         }
-        .scrollIndicators(.hidden)
+        // `.never`, not `.hidden`: hidden is a preference the system overrides
+        // when "Show scroll bars" is set to Always, which put a full-width bar
+        // under the pills. The overflow is obvious from the chips themselves.
+        .scrollIndicators(.never)
         .background(.bar)
         .overlay(alignment: .bottom) { Divider() }
     }
