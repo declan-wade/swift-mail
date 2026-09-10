@@ -60,6 +60,32 @@ nonisolated enum ThreadPreferences {
     }
 }
 
+/// Which on-device model features are switched on.
+nonisolated enum IntelligencePreferences {
+    /// Stored inverted, like `ThreadPreferences`: `UserDefaults` answers a
+    /// missing bool with `false`, and on is the default worth having, so the
+    /// stored flag is the opt-out.
+    static let threadSummariesOffKey = "swift-mail.intelligence.threadSummaries.off"
+
+    static var summarizesThreads: Bool {
+        !UserDefaults.standard.bool(forKey: threadSummariesOffKey)
+    }
+}
+
+/// Whether the reader warns about a sender impersonating a brand.
+///
+/// Deliberately separate from `IntelligencePreferences`: this check is a table
+/// of brands and their sending domains, not a model, and it keeps working with
+/// Apple Intelligence switched off. Filing it under an intelligence setting
+/// would tell the reader something untrue about how it decides.
+nonisolated enum SenderWarningPreferences {
+    static let impersonationOffKey = "swift-mail.senderWarnings.impersonation.off"
+
+    static var warnsAboutImpersonation: Bool {
+        !UserDefaults.standard.bool(forKey: impersonationOffKey)
+    }
+}
+
 /// Where saved attachments land.
 ///
 /// The sandbox is the whole reason this isn't a stored path string: the app is

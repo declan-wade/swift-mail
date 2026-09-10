@@ -51,6 +51,8 @@ private struct GeneralSettings: View {
     @AppStorage(SwipePreferences.leadingKey) private var leadingSwipe = SwipePreferences.leadingDefault.rawValue
     @AppStorage(SwipePreferences.trailingKey) private var trailingSwipe = SwipePreferences.trailingDefault.rawValue
     @AppStorage(DownloadPreferences.bookmarkKey) private var downloadBookmark: Data?
+    @AppStorage(IntelligencePreferences.threadSummariesOffKey) private var threadSummariesOff = false
+    @AppStorage(SenderWarningPreferences.impersonationOffKey) private var impersonationWarningsOff = false
 
     var body: some View {
         Form {
@@ -60,6 +62,38 @@ private struct GeneralSettings: View {
                     Text("When I open the message").tag(true)
                 }
                 .pickerStyle(.radioGroup)
+            }
+
+            Section {
+                Toggle("Summarise long threads", isOn: Binding(
+                    get: { !threadSummariesOff },
+                    set: { threadSummariesOff = !$0 }
+                ))
+                .disabled(!ThreadSummarizer.isSupportedOnThisMac)
+            } header: {
+                Text("Apple Intelligence")
+            } footer: {
+                // The model's own state is worth surfacing here: the toggle
+                // can be on while the feature still can't run, and Settings is
+                // where someone goes to find out why.
+                Text(intelligenceFooter)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section {
+                Toggle("Warn about impersonated senders", isOn: Binding(
+                    get: { !impersonationWarningsOff },
+                    set: { impersonationWarningsOff = !$0 }
+                ))
+            } header: {
+                Text("Sender Warnings")
+            } footer: {
+                Text("Shows a warning when a message's name claims a brand — myGov, ANZ, PayPal — that the sending domain doesn't belong to. It never files anything on its own. This is a check against a list of known sending domains, not Apple Intelligence, so it works either way.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Section {
@@ -121,7 +155,22 @@ private struct GeneralSettings: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .settingsPane(height: 600)
+        .settingsPane(height: 760)
+    }
+
+    /// What the Apple Intelligence section says under its toggle.
+    private var intelligenceFooter: String {
+        let base = "Threads of \(ThreadSummarizer.minimumMessages) or more messages get a short summary at the top of the reader. It runs on this Mac — no part of a message is sent anywhere."
+
+        guard ThreadSummarizer.isSupportedOnThisMac else {
+            return "This Mac doesn’t support Apple Intelligence, so thread summaries aren’t available."
+        }
+
+        guard let advice = ThreadSummarizer.systemAdvice else {
+            return base
+        }
+
+        return "\(base)\n\n\(advice)"
     }
 
     /// The open panel is the grant: picking a folder is what lets the sandbox

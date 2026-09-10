@@ -43,6 +43,11 @@ struct EmailDetailView: View {
     /// claiming the same brand is a fresh question.
     @State private var dismissesSenderWarning = false
     @AppStorage(SafeSenders.storageKey) private var safeSenderDomains = ""
+    /// Owned by the reader rather than the store: it holds a model session and
+    /// a per-thread cache, neither of which anything outside this pane wants.
+    @StateObject private var summarizer = ThreadSummarizer()
+    @AppStorage(IntelligencePreferences.threadSummariesOffKey) private var threadSummariesOff = false
+    @AppStorage(SenderWarningPreferences.impersonationOffKey) private var impersonationWarningsOff = false
 
     var body: some View {
         content
@@ -85,7 +90,7 @@ struct EmailDetailView: View {
         // Safe Senders deliberately doesn't silence this. Trusting a domain
         // with remote images is a statement about tracking pixels, not about
         // whether the sender is who the name says.
-        let impersonated = dismissesSenderWarning
+        let impersonated = dismissesSenderWarning || impersonationWarningsOff
             ? nil
             : SenderImpersonation.impersonatedBrand(
                 displayName: email.from?.first?.name,
@@ -96,6 +101,23 @@ struct EmailDetailView: View {
             if store.conversation.count > 1 {
                 ConversationStrip(store: store, selectedID: email.id)
                 Divider()
+            }
+
+            // Keyed on the thread, not the message: moving between messages of
+            // the same conversation is the same question, already answered.
+            // `EmailDetail` carries no thread id; the conversation's own members
+            // do, and they're what's being summarised anyway.
+            if !threadSummariesOff,
+               let threadID = store.conversation.first?.threadId,
+               ThreadSummarizer.qualifies(messageCount: store.conversation.count) {
+                ThreadSummaryView(summarizer: summarizer)
+                    .task(id: threadID) {
+                        summarizer.summarize(
+                            threadID: threadID,
+                            subject: email.subjectLine,
+                            messages: store.conversation
+                        )
+                    }
             }
 
             ReaderHeader(
@@ -160,6 +182,102 @@ private struct DraftPlaceholder: View {
 /// stacking needs each message's rendered height, and the only way to get that
 /// out of a `WKWebView` is to run JavaScript in it — which this app disables on
 /// purpose for mail it did not author.
+/// The thread in a few lines, from the on-device model.
+///
+/// Deliberately quiet: it renders nothing at all when the model is idle or
+/// unavailable for a reason the reader can't act on, because an empty
+/// placeholder above every long thread costs more attention than it returns.
+private struct ThreadSummaryView: View {
+    @ObservedObject var summarizer: ThreadSummarizer
+
+    var body: some View {
+        switch summarizer.state {
+        case .idle:
+            EmptyView()
+
+        case .summarizing:
+            container {
+                // The partial arrives field by field, so the gist is readable
+                // before the points exist. Showing it as it lands beats a
+                // spinner that resolves into a wall of text.
+                if let partial = summarizer.partial {
+                    body(gist: partial.gist, points: partial.points, actions: partial.actions)
+                } else {
+                    HStack(spacing: Theme.Spacing.sm) {
+                        ProgressView().controlSize(.small)
+                        Text("Summarising\u{2026}")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+        case .ready(let summary):
+            container {
+                body(gist: summary.gist, points: summary.points, actions: summary.actions)
+            }
+
+        case .unavailable(let reason), .failed(let reason):
+            container {
+                Text(reason)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func container<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            Label("Summary", systemImage: "sparkles")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, Theme.Spacing.xxl)
+        .padding(.vertical, Theme.Spacing.md)
+        .background(.bar)
+    }
+
+    /// One layout for the streaming and finished cases, so nothing shifts
+    /// position at the moment the summary completes.
+    @ViewBuilder
+    private func body(gist: String?, points: [String]?, actions: [String]?) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+            if let gist, !gist.isEmpty {
+                Text(gist)
+                    .font(.callout)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            ForEach(points ?? [], id: \.self) { point in
+                line(point, systemImage: "circle.fill", tint: .secondary)
+            }
+
+            ForEach(actions ?? [], id: \.self) { action in
+                line(action, systemImage: "arrow.right.circle.fill", tint: .accentColor)
+            }
+        }
+    }
+
+    private func line(_ text: String, systemImage: String, tint: Color) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.sm) {
+            Image(systemName: systemImage)
+                .font(.system(size: 5))
+                .foregroundStyle(tint)
+
+            Text(text)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 private struct ConversationStrip: View {
     @ObservedObject var store: MailStore
     let selectedID: String
