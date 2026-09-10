@@ -67,6 +67,76 @@ final class ThreadSummarizer: ObservableObject {
         advice(for: SystemLanguageModel.default.availability)
     }
 
+    // MARK: - Diagnostics
+
+    /// The availability case, named rather than described, so the Advanced pane
+    /// reports what the framework actually said instead of a paraphrase.
+    static var availabilityDescription: String {
+        switch SystemLanguageModel.default.availability {
+        case .available: "Available"
+        case .unavailable(.appleIntelligenceNotEnabled): "Apple Intelligence is off"
+        case .unavailable(.deviceNotEligible): "This Mac isn’t eligible"
+        case .unavailable(.modelNotReady): "Model not ready (downloading)"
+        case .unavailable(let reason): "Unavailable (\(reason))"
+        }
+    }
+
+    /// Whether the model handles the language the Mac is set to. An
+    /// unsupported locale fails at generation time rather than at availability,
+    /// which is the kind of thing that reads as "it just doesn't work".
+    static var localeDescription: String {
+        let locale = Locale.current
+        let name = locale.localizedString(forIdentifier: locale.identifier) ?? locale.identifier
+
+        return SystemLanguageModel.default.supportsLocale(locale)
+            ? "\(name) — supported"
+            : "\(name) — not supported"
+    }
+
+    static var contextSizeDescription: String {
+        "\(SystemLanguageModel.default.contextSize) tokens"
+    }
+
+    /// Runs the real path — same instructions, same `ThreadSummary` schema —
+    /// against a fixed three-message thread, and says what came back.
+    ///
+    /// This exists because every other line in the pane describes conditions,
+    /// and conditions looking right is not the same as the thing working. One
+    /// click turns "it never fires" into either a summary or a named error.
+    static func selfTest() async -> String {
+        guard let advice = advice(for: SystemLanguageModel.default.availability) else {
+            return await generateTestSummary()
+        }
+
+        guard case .unavailable(.deviceNotEligible) = SystemLanguageModel.default.availability else {
+            return advice
+        }
+
+        return "This Mac isn’t eligible for Apple Intelligence."
+    }
+
+    private static func generateTestSummary() async -> String {
+        let sample = """
+            Subject: Thursday review
+            1. Ana, today: Can we move Thursday's review to Friday?
+            2. Ben, today: Friday works for me, any time before noon.
+            3. Ana, today: Booked for 10am Friday.
+            """
+
+        do {
+            let session = LanguageModelSession(instructions: instructions)
+            let response = try await session.respond(
+                to: sample,
+                generating: ThreadSummary.self,
+                options: GenerationOptions(sampling: .greedy)
+            )
+
+            return "Worked — “\(response.content.gist)”"
+        } catch {
+            return message(for: error)
+        }
+    }
+
     static var isSupportedOnThisMac: Bool {
         if case .unavailable(.deviceNotEligible) = SystemLanguageModel.default.availability {
             return false
@@ -181,7 +251,7 @@ final class ThreadSummarizer: ObservableObject {
     /// Kept to three short directions. Instructions are charged to the same
     /// window as the thread, and every token spent here is a message that
     /// doesn't fit.
-    private static let instructions = """
+    static let instructions = """
         You summarise email threads for the person who received them.
         Be specific and factual: name who said what, and never invent detail.
         Say only what the messages say.

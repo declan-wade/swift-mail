@@ -423,9 +423,53 @@ private struct NotificationSettings: View {
 /// this account may actually use, and the limits it will accept.
 private struct AdvancedSettings: View {
     @ObservedObject var store: MailStore
+    @AppStorage(IntelligencePreferences.threadSummariesOffKey) private var threadSummariesOff = false
+    @State private var selfTestResult: String?
+    @State private var isSelfTesting = false
 
     var body: some View {
         Form {
+            Section {
+                LabeledContent("Model", value: ThreadSummarizer.availabilityDescription)
+                LabeledContent("Language", value: ThreadSummarizer.localeDescription)
+                LabeledContent("Context window", value: ThreadSummarizer.contextSizeDescription)
+                LabeledContent("Thread summaries", value: threadSummariesOff ? "Off" : "On")
+                LabeledContent("Minimum thread length", value: "\(ThreadSummarizer.minimumMessages) messages")
+                // The gate the reader actually hits: a thread has to be open
+                // and long enough before any of the above matters.
+                LabeledContent("Open thread", value: openThreadDescription)
+
+                HStack {
+                    Button("Run Test Summary") {
+                        Task {
+                            isSelfTesting = true
+                            selfTestResult = await ThreadSummarizer.selfTest()
+                            isSelfTesting = false
+                        }
+                    }
+                    .disabled(isSelfTesting)
+
+                    if isSelfTesting {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+
+                if let selfTestResult {
+                    Text(selfTestResult)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } header: {
+                Text("Apple Intelligence")
+            } footer: {
+                Text("Every condition a thread summary depends on. Run Test Summary to put the model through the same path a thread takes, against a fixed three-message example — the conditions above can all look right and the generation still fail.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Section {
                 urns(store.serverCapabilities, empty: "Connect an account to see what the server supports.")
             } header: {
@@ -467,6 +511,21 @@ private struct AdvancedSettings: View {
         // Diagnostics run long; the tail scrolls rather than making the
         // window taller than the other panes by half again.
         .settingsPane(height: 520)
+    }
+
+    /// What the currently open conversation would contribute, which is the
+    /// first thing to check when summaries "never fire": the model can be
+    /// perfectly available and the open thread simply too short.
+    private var openThreadDescription: String {
+        let count = store.conversation.count
+
+        guard count > 0 else {
+            return "None open"
+        }
+
+        return ThreadSummarizer.qualifies(messageCount: count)
+            ? "\(count) messages — qualifies"
+            : "\(count) message\(count == 1 ? "" : "s") — below the threshold"
     }
 
     @ViewBuilder
