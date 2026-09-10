@@ -326,6 +326,7 @@ final class MailStore: ObservableObject {
     private var accountID: String?
     private var bearerToken: String?
     private var autoFetchTask: Task<Void, Never>?
+    private var wakeTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     /// The mailbox the messages currently on screen were fetched for, which is
     /// not the same as the selected one while a switch is in flight.
@@ -1356,6 +1357,36 @@ final class MailStore: ObservableObject {
         await moveEmail(emailID: emailID, toRole: "trash")
     }
 
+    /// Whichever role this server files junk under. JMAP registers `junk`
+    /// (RFC 8621 §2), but `spam` is common enough in the wild to be worth the
+    /// second look before telling the user the mailbox is missing.
+    private var spamRole: String? {
+        ["junk", "spam"].first { mailbox(role: $0) != nil }
+    }
+
+    /// Junk and phishing are the same move — into the spam mailbox — with a
+    /// different keyword on top. `$junk` is what trains the server's filter;
+    /// `$phishing` is the stronger, separately registered claim (IANA IMAP and
+    /// JMAP Keywords), which lets a report survive the message being refiled
+    /// and lets other clients warn rather than merely file.
+    ///
+    /// The keywords are queued before the move so they land on the message
+    /// while it is still where the user saw it; the outbox sends in order.
+    func reportSpam(emailID: EmailPreview.ID, isPhishing: Bool) async {
+        guard let spamRole else {
+            errorMessage = JMAPError.missingMailbox("Spam").localizedDescription
+            return
+        }
+
+        enqueue(.keyword("$junk", isSet: true), for: emailID)
+
+        if isPhishing {
+            enqueue(.keyword("$phishing", isSet: true), for: emailID)
+        }
+
+        await moveEmail(emailID: emailID, toRole: spamRole)
+    }
+
     // MARK: - Sweep
 
     /// What a sweep would touch: the first page for the user to look at, and
@@ -1998,6 +2029,7 @@ final class MailStore: ObservableObject {
         }
 
         wireNotificationHandlerIfNeeded()
+        observeSystemWakeIfNeeded()
 
         Task {
             await notificationService.requestAuthorizationIfNeeded()
@@ -2016,6 +2048,31 @@ final class MailStore: ObservableObject {
         }
     }
 
+    /// Sleep kills the push connection without telling anyone: the socket is
+    /// gone, but the read just blocks until its 330s timeout, so mail deleted
+    /// on another client while the lid was shut doesn't land for minutes after
+    /// waking. Waking is the cue to drop the dead stream and start a fresh one,
+    /// which reconciles on the way up.
+    private func observeSystemWakeIfNeeded() {
+        guard wakeTask == nil else {
+            return
+        }
+
+        wakeTask = Task { [weak self] in
+            let wakes = NSWorkspace.shared.notificationCenter
+                .notifications(named: NSWorkspace.didWakeNotification)
+
+            for await _ in wakes {
+                guard let self, let session = self.session else {
+                    continue
+                }
+
+                self.stopAutoFetch()
+                self.startAutoFetchIfNeeded(session: session)
+            }
+        }
+    }
+
     /// Consumes the JMAP push stream. Each `StateChange` carries the new state
     /// per type; the connection is re-established after the server closes it
     /// (`closeafter`) or a transport error, with a capped exponential backoff.
@@ -2023,6 +2080,15 @@ final class MailStore: ObservableObject {
         var backoff = Duration.seconds(1)
 
         while !Task.isCancelled {
+            // Reconcile before every connection attempt, not just after a
+            // disconnect. State changes are edge-triggered, so anything that
+            // happened while off the wire — asleep, offline, not yet
+            // connected — is only ever seen by asking. Doing it here also means
+            // a failed sync is retried by the same backoff as a failed connect,
+            // and a server that refuses the stream outright degrades into
+            // polling at that interval instead of going quiet.
+            await syncNow()
+
             do {
                 let eventSource = JMAPEventSource(url: eventSourceURL, bearerToken: bearerToken)
                 for try await change in eventSource.events() {
@@ -2038,17 +2104,6 @@ final class MailStore: ObservableObject {
                 try? await Task.sleep(for: backoff)
                 backoff = min(backoff * 2, .seconds(120))
             }
-
-            // Reconcile on every disconnect, clean or failed. State changes are
-            // edge-triggered, so anything that happened while off the wire is
-            // only ever seen by asking. Reconciling here also means a server
-            // that refuses the stream outright degrades into polling at the
-            // backoff interval instead of going quiet.
-            guard !Task.isCancelled else {
-                return
-            }
-
-            await syncNow()
         }
     }
 
@@ -2056,12 +2111,8 @@ final class MailStore: ObservableObject {
     /// cheap type-state endpoint and only do real work when something moved.
     private func runPollingLoop() async {
         while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(90))
-            guard !Task.isCancelled else {
-                return
-            }
-
             await syncNow()
+            try? await Task.sleep(for: .seconds(90))
         }
     }
 

@@ -158,6 +158,32 @@ private struct MailHomeView: View {
             .help("Delete (⌘⌫)")
             .keyboardShortcut(.delete, modifiers: .command)
             .disabled(store.selectedEmail == nil || store.movingEmailIDs.contains(store.selectedEmail?.id ?? ""))
+
+            // A `Menu` with a `primaryAction` is the split button: the label
+            // half files as junk in one click — the overwhelmingly common
+            // case — and the chevron half holds the stronger, separate claim,
+            // rather than making every junk report a two-step.
+            //
+            // It sits at the end of the group because a split button gets a
+            // capsule of its own either way; between Archive and Delete that
+            // break would fall mid-group and read as the wrong grouping.
+            Menu {
+                Button("Move to Spam") {
+                    reportSpam(isPhishing: false)
+                }
+
+                Button("Report Phishing", role: .destructive) {
+                    reportSpam(isPhishing: true)
+                }
+            } label: {
+                Label("Spam", systemImage: "exclamationmark.octagon")
+                    .symbolEffect(.bounce, value: store.movingEmailIDs.count)
+            } primaryAction: {
+                reportSpam(isPhishing: false)
+            }
+            .help("Move to Spam (⇧⌘J)")
+            .keyboardShortcut("j", modifiers: [.command, .shift])
+            .disabled(store.selectedEmail == nil || store.movingEmailIDs.contains(store.selectedEmail?.id ?? ""))
         }
 
         ToolbarSpacer(.fixed)
@@ -209,6 +235,14 @@ private struct MailHomeView: View {
             }
             .help("Account")
         }
+    }
+
+    private func reportSpam(isPhishing: Bool) {
+        guard let email = store.selectedEmail else {
+            return
+        }
+
+        Task { await store.reportSpam(emailID: email.id, isPhishing: isPhishing) }
     }
 
     private func compose(_ draft: ComposeDraft) {
