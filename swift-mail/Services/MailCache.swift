@@ -82,7 +82,7 @@ final class MailCache: @unchecked Sendable {
     static let shared = MailCache()
 
     /// Bump on any change an older file can't satisfy. The old file is dropped.
-    private static let schemaVersion = 2
+    private static let schemaVersion = 3
 
     /// Message bodies are the only unbounded table. Evicted oldest-first once
     /// the total passes this.
@@ -212,6 +212,12 @@ final class MailCache: @unchecked Sendable {
             attempts INTEGER,
             queued_at REAL);
 
+        CREATE TABLE IF NOT EXISTS recipient (
+            email TEXT PRIMARY KEY,
+            name TEXT,
+            sends INTEGER,
+            last_sent_at REAL);
+
         CREATE INDEX IF NOT EXISTS email_by_time ON email (received_at DESC);
         CREATE INDEX IF NOT EXISTS outbox_by_email ON outbox (email_id);
         CREATE INDEX IF NOT EXISTS email_mailbox_lookup ON email_mailbox (mailbox_id);
@@ -229,6 +235,7 @@ final class MailCache: @unchecked Sendable {
         DROP TABLE IF EXISTS email_mailbox;
         DROP TABLE IF EXISTS email_body;
         DROP TABLE IF EXISTS outbox;
+        DROP TABLE IF EXISTS recipient;
         """)
 
         if let base = blobBase {
@@ -386,6 +393,57 @@ final class MailCache: @unchecked Sendable {
         query("SELECT json FROM email WHERE id = ?;", bind: [id]) { $0.text(0) }
             .compactMap { decode(EmailPreview.self, from: $0) }
             .first
+    }
+
+    // MARK: - Recipients
+
+    /// Everyone this account has written to, for the compose field's
+    /// completions. Small enough to hold in memory — one row per correspondent,
+    /// not per message — so the field can answer a keystroke without touching
+    /// the database.
+    func recipients() -> [Recipient] {
+        query("SELECT email, name, sends, last_sent_at FROM recipient;", bind: []) { row in
+            Recipient(
+                email: row.text(0) ?? "",
+                name: row.text(1),
+                sends: row.int(2),
+                lastSentAt: Date(timeIntervalSinceReferenceDate: row.double(3))
+            )
+        }
+        .filter { !$0.email.isEmpty }
+    }
+
+    /// The newest sent message already counted, which is where the next indexing
+    /// pass picks up. Derived from the rows rather than kept as its own
+    /// watermark, so the two can never disagree.
+    func lastIndexedSendDate() -> Date? {
+        query("SELECT MAX(last_sent_at) FROM recipient;", bind: []) { $0.double(0) }
+            .first
+            .flatMap { $0 > 0 ? Date(timeIntervalSinceReferenceDate: $0) : nil }
+    }
+
+    /// Writes the tally wholesale. The caller folds new messages into what it
+    /// read, so this replaces rather than increments — one place decides what a
+    /// count means, and it isn't SQL.
+    func record(recipients: some Collection<Recipient>) {
+        guard !recipients.isEmpty else {
+            return
+        }
+
+        transaction {
+            for recipient in recipients {
+                run("""
+                    INSERT OR REPLACE INTO recipient (email, name, sends, last_sent_at)
+                    VALUES (?, ?, ?, ?);
+                    """,
+                    bind: [
+                        recipient.email,
+                        recipient.name,
+                        recipient.sends,
+                        recipient.lastSentAt.timeIntervalSinceReferenceDate
+                    ])
+            }
+        }
     }
 
     // MARK: - Outbox

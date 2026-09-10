@@ -9,6 +9,10 @@ import SwiftUI
 struct RecipientField: NSViewRepresentable {
     @Binding var addresses: [EmailAddress]
     var placeholder: String
+    /// What to offer for the substring being typed, best first. The dropdown,
+    /// its keyboard handling and its selection are `NSTokenField`'s — this only
+    /// has to answer the question.
+    var completions: (String) -> [String] = { _ in [] }
 
     func makeNSView(context: Context) -> NSTokenField {
         let field = NSTokenField()
@@ -29,6 +33,7 @@ struct RecipientField: NSViewRepresentable {
 
     func updateNSView(_ field: NSTokenField, context: Context) {
         context.coordinator.addresses = $addresses
+        context.coordinator.completions = completions
 
         // Never rewrite the field while it holds an entry in progress.
         guard field.currentEditor() == nil else {
@@ -44,14 +49,31 @@ struct RecipientField: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(addresses: $addresses)
+        Coordinator(addresses: $addresses, completions: completions)
     }
 
     final class Coordinator: NSObject, NSTokenFieldDelegate {
         var addresses: Binding<[EmailAddress]>
+        var completions: (String) -> [String]
 
-        init(addresses: Binding<[EmailAddress]>) {
+        init(addresses: Binding<[EmailAddress]>, completions: @escaping (String) -> [String]) {
             self.addresses = addresses
+            self.completions = completions
+        }
+
+        /// Called on every keystroke, on the main thread, with the caret held
+        /// mid-edit — so the answer has to come from memory. Nothing is
+        /// preselected: `-1` leaves the typed text standing until the reader
+        /// picks a row, rather than completing over what they are still typing.
+        func tokenField(
+            _ tokenField: NSTokenField,
+            completionsForSubstring substring: String,
+            indexOfToken tokenIndex: Int,
+            indexOfSelectedItem selectedIndex: UnsafeMutablePointer<Int>?
+        ) -> [Any]? {
+            selectedIndex?.pointee = -1
+
+            return completions(substring)
         }
 
         static func parse(_ objectValue: Any?) -> [EmailAddress] {

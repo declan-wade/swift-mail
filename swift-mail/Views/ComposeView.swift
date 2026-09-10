@@ -89,7 +89,7 @@ struct ComposeView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ComposeHeader(draft: $draft, identities: store.identities)
+            ComposeHeader(draft: $draft, identities: store.identities, completions: store.recipientCompletions)
 
             Divider()
 
@@ -497,6 +497,8 @@ struct ComposeView: View {
 private struct ComposeHeader: View {
     @Binding var draft: ComposeDraft
     let identities: [MailIdentity]
+    /// Shared by all three fields: Cc and Bcc want the same history To does.
+    let completions: (String) -> [String]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -514,7 +516,7 @@ private struct ComposeHeader: View {
 
             ComposeFieldRow(label: "To") {
                 HStack(spacing: Theme.Spacing.sm) {
-                    RecipientField(addresses: $draft.to, placeholder: "")
+                    RecipientField(addresses: $draft.to, placeholder: "", completions: completions)
 
                     Button {
                         draft.showsCarbonCopy.toggle()
@@ -529,11 +531,11 @@ private struct ComposeHeader: View {
 
             if draft.showsCarbonCopy {
                 ComposeFieldRow(label: "Cc") {
-                    RecipientField(addresses: $draft.cc, placeholder: "")
+                    RecipientField(addresses: $draft.cc, placeholder: "", completions: completions)
                 }
 
                 ComposeFieldRow(label: "Bcc") {
-                    RecipientField(addresses: $draft.bcc, placeholder: "")
+                    RecipientField(addresses: $draft.bcc, placeholder: "", completions: completions)
                 }
             }
 

@@ -425,6 +425,10 @@ final class MailStore: ObservableObject {
     private var accountID: String?
     private var bearerToken: String?
     private var autoFetchTask: Task<Void, Never>?
+    /// The compose field's completion source, kept in memory because
+    /// `NSTokenField` asks for completions synchronously on every keystroke.
+    private(set) var recipients: [Recipient] = []
+    private var recipientIndexTask: Task<Void, Never>?
     private var wakeTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     /// The mailbox the messages currently on screen were fetched for, which is
@@ -938,6 +942,9 @@ final class MailStore: ObservableObject {
 
     func removeAccount() {
         stopAutoFetch()
+        recipientIndexTask?.cancel()
+        recipientIndexTask = nil
+        recipients = []
         UserDefaults.standard.removeObject(forKey: accountStorageKey)
         try? KeychainStore.deleteToken()
         // Signing out has to take the cached mail with it.
@@ -987,6 +994,12 @@ final class MailStore: ObservableObject {
             await loadIdentities()
             cache.setMailboxes(mailboxes)
             cache.setIdentities(identities)
+
+            // Cached first so the field is useful offline and before the
+            // network answers; the Sent pass then tops it up in the background
+            // rather than holding up first paint.
+            recipients = cache.recipients()
+            startRecipientIndexing()
 
             // Reconnecting is the moment anything queued while offline can go.
             await drainOutbox()
@@ -1734,6 +1747,109 @@ final class MailStore: ObservableObject {
         value.trimmingCharacters(in: CharacterSet(charactersIn: "<> ")).lowercased()
     }
 
+    // MARK: - Recipient suggestions
+
+    /// Completions for what has been typed into a recipient field.
+    ///
+    /// Synchronous by necessity — `NSTokenField` asks on the main thread while
+    /// the caret is between characters — which is why the index lives in
+    /// memory rather than being queried per keystroke.
+    func recipientCompletions(for substring: String) -> [String] {
+        RecipientIndex.completions(for: substring, in: recipients)
+    }
+
+    /// Folds the recipients of a message being sent straight into the index.
+    ///
+    /// The Sent pass would find this message eventually, but "eventually" is
+    /// the next refresh, and the moment you are most likely to want an address
+    /// again is right after using it. This is also the only place Bcc is seen:
+    /// Sent doesn't carry it. A message counted here and counted again by a
+    /// later pass is off by one in a ranking heuristic, which isn't worth
+    /// machinery to prevent.
+    private func recordRecipients(of draft: ComposeDraft) {
+        var tally = Dictionary(recipients.map { ($0.email, $0) }, uniquingKeysWith: { first, _ in first })
+        RecipientIndex.folding(draft.to + draft.cc + draft.bcc, sentAt: .now, into: &tally)
+
+        recipients = Array(tally.values)
+        cache.record(recipients: recipients)
+    }
+
+    /// How much of Sent to read on a first, empty index. Ten pages is plenty to
+    /// know who someone writes to; reading the whole mailbox would spend a
+    /// hundred requests refining an ordering nobody can tell apart.
+    private static let recipientIndexPages = 10
+    private static let recipientIndexPageSize = 50
+
+    private func startRecipientIndexing() {
+        guard recipientIndexTask == nil else {
+            return
+        }
+
+        recipientIndexTask = Task { [weak self] in
+            await self?.indexSentRecipients()
+            self?.recipientIndexTask = nil
+        }
+    }
+
+    /// Walks Sent newest-first, folding each message's recipients in, stopping
+    /// at the newest message already counted.
+    ///
+    /// That watermark is what makes this cheap after the first run: a session
+    /// that has sent nothing new reads one page and stops. It is also why the
+    /// walk has to be newest-first — which is the order the query already
+    /// returns, so it costs nothing to rely on.
+    private func indexSentRecipients() async {
+        guard let client = makeClient(), let session, let accountID,
+              let sentID = mailbox(role: "sent")?.id else {
+            return
+        }
+
+        let watermark = cache.lastIndexedSendDate()
+        var tally = Dictionary(recipients.map { ($0.email, $0) }, uniquingKeysWith: { first, _ in first })
+        var didFold = false
+
+        pages: for page in 0..<Self.recipientIndexPages {
+            guard !Task.isCancelled else {
+                return
+            }
+
+            guard let result = try? await client.fetchEmailPreviews(
+                session: session,
+                accountID: accountID,
+                mailboxID: sentID,
+                position: page * Self.recipientIndexPageSize,
+                limit: Self.recipientIndexPageSize
+            ), !result.previews.isEmpty else {
+                break
+            }
+
+            for preview in result.previews {
+                let sentAt = preview.receivedAt ?? .now
+
+                // Newest-first means the first message at or below the
+                // watermark is the last new one: everything past it is already
+                // counted, and counting it twice would inflate the ranking.
+                if let watermark, sentAt <= watermark {
+                    break pages
+                }
+
+                RecipientIndex.folding(RecipientIndex.addressed(in: preview), sentAt: sentAt, into: &tally)
+                didFold = true
+            }
+
+            if result.previews.count < Self.recipientIndexPageSize {
+                break
+            }
+        }
+
+        guard didFold else {
+            return
+        }
+
+        recipients = Array(tally.values)
+        cache.record(recipients: recipients)
+    }
+
     // MARK: - Attachments
 
     /// Uploads one file and returns it ready to attach. Throws rather than
@@ -1852,6 +1968,8 @@ final class MailStore: ObservableObject {
             fileInMailboxID: fileInMailboxID,
             sendAt: releaseAt
         )
+
+        recordRecipients(of: draft)
 
         await discardResumedDraft(draft, context: context)
 
