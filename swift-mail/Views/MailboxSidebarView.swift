@@ -7,6 +7,7 @@ struct MailboxSidebarView: View {
     @AppStorage("swift-mail.sidebar.foldersExpanded") private var foldersExpanded = true
     @AppStorage("swift-mail.sidebar.favouritesExpanded") private var favouritesExpanded = true
     @AppStorage(FavouriteMailboxes.storageKey) private var favouriteList = ""
+    @AppStorage(SnoozePreferences.showsSidebarListKey) private var showsSnoozed = true
 
     var body: some View {
         List(selection: $store.selectedMailboxID) {
@@ -52,6 +53,13 @@ struct MailboxSidebarView: View {
             // an untagged account looking exactly as it did.
             if !store.tags.isEmpty {
                 TagFilterBar(store: store)
+            }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            // Absent when nothing is snoozed, like Favourites: an empty panel
+            // is a promise of content that isn't there.
+            if showsSnoozed && !store.snoozedEmails.isEmpty {
+                SnoozedSidebarList(store: store)
             }
         }
         .onChange(of: store.selectedMailboxID) { _, mailboxID in

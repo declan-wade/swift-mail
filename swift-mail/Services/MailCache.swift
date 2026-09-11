@@ -14,11 +14,13 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 /// server until it drains — across a relaunch if need be.
 nonisolated struct OutboxEntry: Identifiable, Hashable, Codable {
     /// What to do. Deliberately a closed set: an outbox that can hold arbitrary
-    /// work is a job queue, and this only ever needs the two mutations the UI
+    /// work is a job queue, and this only ever needs the mutations the UI
     /// actually offers.
     enum Action: Hashable, Codable {
         case keyword(String, isSet: Bool)
         case move(mailboxID: String)
+        /// A move into the Snoozed mailbox that also sets when it comes back.
+        case snooze(mailboxID: String, until: Date)
     }
 
     var id: UUID
@@ -42,7 +44,9 @@ nonisolated struct OutboxEntry: Identifiable, Hashable, Codable {
     var coalescingKey: String {
         switch action {
         case .keyword(let keyword, _): "keyword:\(keyword)"
-        case .move: "move"
+        // Both replace `mailboxIds`, so a snooze and an archive supersede
+        // each other like two moves do.
+        case .move, .snooze: "move"
         }
     }
 
@@ -52,7 +56,7 @@ nonisolated struct OutboxEntry: Identifiable, Hashable, Codable {
         case .keyword("$seen", let isSet): preview.settingSeen(isSet)
         case .keyword("$flagged", let isSet): preview.settingFlagged(isSet)
         case .keyword: preview
-        case .move(let mailboxID): preview.settingMailbox(mailboxID)
+        case .move(let mailboxID), .snooze(let mailboxID, _): preview.settingMailbox(mailboxID)
         }
     }
 }

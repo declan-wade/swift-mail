@@ -13,6 +13,10 @@ struct SettingsView: View {
                 GeneralSettings(store: store)
             }
 
+            Tab("Snooze", systemImage: "moon.zzz") {
+                SnoozeSettings()
+            }
+
             Tab("Tags", systemImage: "tag") {
                 TagSettings(store: store)
             }
@@ -220,6 +224,114 @@ private struct GeneralSettings: View {
     private var swipeOptions: some View {
         ForEach(SwipeAction.allCases) { action in
             Text(action.settingsLabel).tag(action.rawValue)
+        }
+    }
+}
+
+// MARK: - Snooze
+
+/// The times the Snooze menu offers, in the order it offers them.
+private struct SnoozeSettings: View {
+    @AppStorage(SnoozePreferences.presetsKey) private var presetData: Data?
+
+    private var presets: Binding<[SnoozePreset]> {
+        Binding(
+            get: { SnoozePreferences.presets(from: presetData) },
+            set: { presetData = SnoozePreferences.data(for: $0) }
+        )
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                ForEach(Array(presets.wrappedValue.enumerated()), id: \.element.id) { index, preset in
+                    SnoozePresetRow(
+                        preset: presets[index],
+                        canMoveUp: index > 0,
+                        onMoveUp: { presets.wrappedValue.swapAt(index, index - 1) },
+                        onRemove: { presets.wrappedValue.remove(at: index) }
+                    )
+                }
+
+                HStack {
+                    Button("Add Time") {
+                        presets.wrappedValue.append(SnoozePreset(kind: .tomorrow, hour: 8))
+                    }
+
+                    Spacer()
+
+                    // Only offered once there is something to restore.
+                    if presetData != nil {
+                        Button("Restore Defaults") {
+                            presetData = nil
+                        }
+                    }
+                }
+            } header: {
+                Text("Snooze Times")
+            } footer: {
+                Text("The Snooze menu lists these in this order, with Custom\u{2026} below them for anything else. Clicking the Snooze button itself uses the first one that's still ahead — a time already gone today is skipped until tomorrow.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .settingsPane(height: 420)
+    }
+}
+
+private struct SnoozePresetRow: View {
+    @Binding var preset: SnoozePreset
+    let canMoveUp: Bool
+    let onMoveUp: () -> Void
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            Picker("When", selection: $preset.kind) {
+                ForEach(SnoozePreset.Kind.allCases) { kind in
+                    Text(kind.settingsLabel).tag(kind)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+
+            if preset.kind == .weekday {
+                Picker("Day", selection: $preset.weekday) {
+                    ForEach(1...7, id: \.self) { day in
+                        Text(Calendar.current.weekdaySymbols[day - 1]).tag(day)
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+            }
+
+            if preset.kind == .hoursLater {
+                Stepper(preset.hour == 1 ? "1 hour" : "\(preset.hour) hours", value: $preset.hour, in: 1...72)
+            } else {
+                Picker("Time", selection: $preset.hour) {
+                    ForEach(0..<24, id: \.self) { hour in
+                        Text(SnoozePreset.hourText(hour)).tag(hour)
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+            }
+
+            Spacer()
+
+            Button(action: onMoveUp) {
+                Image(systemName: "arrow.up")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!canMoveUp)
+            .help("Move Up")
+
+            Button(action: onRemove) {
+                Image(systemName: "minus.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("Remove")
         }
     }
 }

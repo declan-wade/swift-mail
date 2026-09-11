@@ -84,6 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// often, not a preference set once.
 private struct ViewCommands: Commands {
     @ObservedObject var store: MailStore
+    @AppStorage(SnoozePreferences.showsSidebarListKey) private var showsSnoozed = true
 
     var body: some Commands {
         CommandGroup(after: .toolbar) {
@@ -92,6 +93,8 @@ private struct ViewCommands: Commands {
                 set: { store.groupsIntoThreads = $0 }
             ))
             .keyboardShortcut("t", modifiers: [.command, .control])
+
+            Toggle("Show Snoozed in Sidebar", isOn: $showsSnoozed)
         }
     }
 }

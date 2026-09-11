@@ -583,6 +583,86 @@ final class JMAPClient {
         }
     }
 
+    /// Files a message into the Snoozed mailbox with a wake-up time.
+    ///
+    /// One `Email/set` does both, because the server only honours `snoozed` on
+    /// a message in that mailbox, and moves it back out itself at `until` —
+    /// whether or not this app is running. With no `moveToMailboxId` it goes
+    /// to the Inbox, and it comes back unread so it resurfaces rather than
+    /// slipping back in unnoticed.
+    func snoozeEmail(
+        session: JMAPSession,
+        accountID: String,
+        emailID: String,
+        snoozedMailboxID: String,
+        until: Date,
+        using capabilities: [String]
+    ) async throws {
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "Email/set",
+                    [
+                        "accountId": accountID,
+                        "update": [
+                            emailID: [
+                                "mailboxIds": [snoozedMailboxID: true],
+                                "snoozed": [
+                                    "until": Self.utcDate(until),
+                                    "setKeywords": ["$seen": false]
+                                ]
+                            ]
+                        ]
+                    ],
+                    "snoozeEmail"
+                ]
+            ],
+            using: capabilities
+        )
+
+        let payload = try response.payload(named: "Email/set", clientID: "snoozeEmail")
+        try Self.throwIfRejected(payload, key: "notUpdated")
+    }
+
+    /// Everything in the Snoozed mailbox with its wake-up time, soonest first.
+    ///
+    /// Sorted here rather than by the query: the draft defines no sort on the
+    /// wake-up time, and Cyrus's `snoozedUntil` is its own extension.
+    // ponytail: first 100 only; page it if anyone snoozes more than that.
+    func fetchSnoozedEmails(
+        session: JMAPSession,
+        accountID: String,
+        mailboxID: String,
+        using capabilities: [String]
+    ) async throws -> [SnoozedEmail] {
+        let response = try await call(
+            apiURL: session.apiURL,
+            methodCalls: [
+                [
+                    "Email/query",
+                    ["accountId": accountID, "filter": ["inMailbox": mailboxID], "limit": 100],
+                    "snoozedQuery"
+                ],
+                [
+                    "Email/get",
+                    [
+                        "accountId": accountID,
+                        "#ids": ["resultOf": "snoozedQuery", "name": "Email/query", "path": "/ids"],
+                        "properties": ["id", "subject", "from", "snoozed"]
+                    ],
+                    "snoozedEmails"
+                ]
+            ],
+            using: capabilities
+        )
+
+        let payload = try response.payload(named: "Email/get", clientID: "snoozedEmails")
+        let data = try JSONSerialization.data(withJSONObject: payload["list"] ?? [])
+
+        return try decoder.decode([SnoozedEmail].self, from: data).sorted(by: SnoozedEmail.soonestFirst)
+    }
+
     /// What the server returns from the upload endpoint (RFC 8620 6.1).
     nonisolated struct UploadedBlob: Decodable {
         let blobId: String
@@ -1259,6 +1339,9 @@ nonisolated enum JMAPCapability {
     /// draft-ietf-extra-email-snooze, expired and undocumented by Fastmail —
     /// checked at runtime rather than assumed.
     static let snoozeURN = "urn:ietf:params:jmap:mail:snooze"
+    /// Cyrus's own mail extension, which is where Fastmail's server (Cyrus)
+    /// keeps `snoozed` when the draft's URN isn't advertised.
+    static let cyrusMailURN = "https://cyrusimap.org/ns/jmap/mail"
 
     /// Fastmail's Masked Email extension. Vendor-specific and gated on the API
     /// token's own scope, so a token without it simply doesn't advertise the

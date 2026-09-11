@@ -212,6 +212,12 @@ struct EmailListView: View {
 
         Divider()
 
+        if store.supportsSnooze {
+            Menu("Snooze") {
+                SnoozeMenuItems(store: store, emailID: email.id)
+            }
+        }
+
         Button("Archive") {
             Task { await store.archive(emailID: email.id) }
         }

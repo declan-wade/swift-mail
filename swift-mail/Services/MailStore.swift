@@ -488,6 +488,17 @@ final class MailStore: ObservableObject {
         }
     }
 
+    /// What is waiting in the Snoozed mailbox, soonest first, for the sidebar.
+    @Published private(set) var snoozedEmails: [SnoozedEmail] = []
+    /// The message the custom snooze sheet is picking a time for. On the store
+    /// rather than a view because the toolbar, the list and the sidebar all
+    /// open the same sheet.
+    @Published var customSnoozeEmailID: EmailPreview.ID?
+    /// A message to select once the folder being switched to has loaded;
+    /// `loadEmails` resets the selection when it starts, so selecting it any
+    /// earlier is undone.
+    private var selectionAfterLoad: EmailPreview.ID?
+
     /// The send currently offered for undo, if any.
     @Published private(set) var pendingSend: PendingSend?
     private var undoWindowTask: Task<Void, Never>?
@@ -656,8 +667,25 @@ final class MailStore: ObservableObject {
         maxDelayedSend > 0
     }
 
+    /// What a snooze request declares in `using`, or nil when this account
+    /// can't snooze: the draft's own URN where the server advertises it, and
+    /// Cyrus's mail extension — where Fastmail keeps `snoozed` — otherwise.
+    /// Declaring one the server doesn't know fails the whole request, so it
+    /// is only ever one that was advertised.
+    private var snoozeCapabilities: [String]? {
+        guard let session else {
+            return nil
+        }
+
+        return [JMAPCapability.snoozeURN, JMAPCapability.cyrusMailURN]
+            .first { session.supports($0, accountID: accountID) }
+            .map { JMAPCapability.mail + [$0] }
+    }
+
+    /// The capability alone isn't enough: `snoozed` is only honoured on a
+    /// message in the mailbox with that role.
     var supportsSnooze: Bool {
-        session?.supports(JMAPCapability.snoozeURN, accountID: accountID) ?? false
+        snoozeCapabilities != nil && mailbox(role: "snoozed") != nil
     }
 
     var hasConfiguredAccount: Bool {
@@ -1078,6 +1106,8 @@ final class MailStore: ObservableObject {
             if let selectedMailboxID {
                 await loadEmails(mailboxID: selectedMailboxID)
             }
+
+            await loadSnoozedEmails()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -1136,7 +1166,9 @@ final class MailStore: ObservableObject {
             threadEmailIDs = page.threadEmailIDs
             applyPageMetadata(page)
             loadedMailboxID = mailboxID
-            selectedEmailID = emails.first?.id
+            let wanted = selectionAfterLoad
+            selectionAfterLoad = nil
+            selectedEmailID = emails.first { $0.id == wanted }?.id ?? emails.first?.id
             cacheVisibleList()
 
             // The list has what it needs now; the reader's fetch is a separate
@@ -1469,6 +1501,21 @@ final class MailStore: ObservableObject {
                 emailID: entry.emailID,
                 toMailboxID: mailboxID
             )
+        case .snooze(let mailboxID, let until):
+            // Queued while the account could snooze; a session that reconnects
+            // without the capability can't send it, and retrying won't change that.
+            guard let capabilities = snoozeCapabilities else {
+                throw JMAPError.methodError("unknownCapability")
+            }
+
+            try await client.snoozeEmail(
+                session: session,
+                accountID: accountID,
+                emailID: entry.emailID,
+                snoozedMailboxID: mailboxID,
+                until: until,
+                using: capabilities
+            )
         }
     }
 
@@ -1502,8 +1549,11 @@ final class MailStore: ObservableObject {
             applyFlagState(emailID: entry.emailID, isFlagged: !isSet)
         case .keyword:
             break
-        case .move:
+        case .move, .snooze:
             await reloadVisibleList()
+            // Either can have changed what is snoozed: a snooze, or an
+            // unsnooze's move back to the Inbox.
+            await loadSnoozedEmails()
         }
     }
 
@@ -1528,12 +1578,92 @@ final class MailStore: ObservableObject {
         case .keyword("$seen", _): update(&updatingReadStateEmailIDs)
         case .keyword("$flagged", _): update(&updatingFlagEmailIDs)
         case .keyword: break
-        case .move: update(&movingEmailIDs)
+        case .move, .snooze: update(&movingEmailIDs)
         }
     }
 
     func archive(emailID: EmailPreview.ID) async {
         await moveEmail(emailID: emailID, toRole: "archive")
+    }
+
+    // MARK: - Snooze
+
+    /// Files the message into Snoozed until `until`, down the same optimistic,
+    /// outbox-backed path as archive: it leaves the list at once, and the
+    /// server brings it back whether or not the app is running.
+    func snooze(emailID: EmailPreview.ID, until: Date) async {
+        guard let snoozed = mailbox(role: "snoozed") else {
+            errorMessage = JMAPError.missingMailbox("Snoozed").localizedDescription
+            return
+        }
+
+        errorMessage = nil
+
+        let preview = emails.first { $0.id == emailID } ?? cache.message(id: emailID)
+        let listed = snoozedEmails.first { $0.id == emailID }
+        snoozedEmails.removeAll { $0.id == emailID }
+        snoozedEmails.append(SnoozedEmail(
+            id: emailID,
+            subject: preview?.subject ?? listed?.subject,
+            from: preview?.from ?? listed?.from,
+            snoozed: .init(until: until)
+        ))
+        snoozedEmails.sort(by: SnoozedEmail.soonestFirst)
+
+        // Rescheduling from inside Snoozed leaves the message where it is.
+        if selectedMailboxID != snoozed.id {
+            applyMove(emailID: emailID)
+        }
+
+        cacheOptimistic(emailID: emailID) { $0.settingMailbox(snoozed.id) }
+        enqueue(.snooze(mailboxID: snoozed.id, until: until), for: emailID)
+
+        await drainOutbox()
+    }
+
+    /// Back to the Inbox now. Leaving the Snoozed mailbox is what clears a
+    /// wake-up time, so this is an ordinary move.
+    func unsnooze(emailID: EmailPreview.ID) async {
+        snoozedEmails.removeAll { $0.id == emailID }
+        await moveEmail(emailID: emailID, toRole: "inbox")
+    }
+
+    func loadSnoozedEmails() async {
+        guard let capabilities = snoozeCapabilities,
+              let snoozedID = mailbox(role: "snoozed")?.id,
+              let client = makeClient(),
+              let session,
+              let accountID else {
+            return
+        }
+
+        do {
+            snoozedEmails = try await client.fetchSnoozedEmails(
+                session: session,
+                accountID: accountID,
+                mailboxID: snoozedID,
+                using: capabilities
+            )
+        } catch {
+            backgroundErrorMessage = error.localizedDescription
+        }
+    }
+
+    /// Opens a message from the sidebar's snoozed list, in the Snoozed mailbox
+    /// it is actually filed in.
+    func openSnoozed(emailID: EmailPreview.ID) {
+        guard let snoozedID = mailbox(role: "snoozed")?.id else {
+            return
+        }
+
+        if selectedMailboxID == snoozedID {
+            selectedEmailID = emailID
+        } else {
+            // The sidebar's `onChange` does the loading; this just says which
+            // message to land on when it has.
+            selectionAfterLoad = emailID
+            selectedMailboxID = snoozedID
+        }
     }
 
     func delete(emailID: EmailPreview.ID) async {
@@ -2620,9 +2750,20 @@ final class MailStore: ObservableObject {
             // Without this the on-disk cursor goes stale while the app stays
             // open, and a long-running session still relaunches into a big diff.
             cacheVisibleList()
+
+            // The snoozed list is only asked for again when this delta touched
+            // it: something filed into Snoozed, or something it lists changed
+            // or went — which is also how a snooze waking shows up.
+            let listed = Set(snoozedEmails.map(\.id))
+            if let snoozedID = mailbox(role: "snoozed")?.id,
+               !listed.isDisjoint(with: destroyedSet)
+                || reconciled.contains(where: { $0.mailboxIds?[snoozedID] == true || listed.contains($0.id) }) {
+                await loadSnoozedEmails()
+            }
         } catch {
             emailState = newState
             await reloadVisibleList()
+            await loadSnoozedEmails()
         }
     }
 
@@ -2676,14 +2817,28 @@ final class MailStore: ObservableObject {
         // the top (the list is sorted newest-first) if not already present.
         if let selectedMailboxID, activeSearch == nil {
             let known = Set(emails.map(\.id))
-            let additions = previews
-                .filter {
-                    createdIDs.contains($0.id)
-                        && $0.mailboxIds?[selectedMailboxID] == true
-                        && !known.contains($0.id)
-                        && matchesActiveTag($0)
+            let knownThreads = Set(emails.compactMap(\.threadId))
+            let oldestLoaded = hasMoreEmails ? emails.last?.receivedAt : nil
+            let additions = previews.filter { preview in
+                guard preview.mailboxIds?[selectedMailboxID] == true,
+                      !known.contains(preview.id),
+                      matchesActiveTag(preview) else {
+                    return false
                 }
-                .sorted { ($0.receivedAt ?? .distantPast) > ($1.receivedAt ?? .distantPast) }
+
+                if createdIDs.contains(preview.id) {
+                    return true
+                }
+
+                // Moved in rather than arrived — a snooze waking, a move made
+                // on another device. Only within the range already loaded, as
+                // paging finds the rest, and never in place of a conversation
+                // that is already listed: that would swap its row for an
+                // older message.
+                let isInLoadedRange = oldestLoaded.map { (preview.receivedAt ?? .distantPast) >= $0 } ?? true
+                let isThreadListed = groupsIntoThreads && preview.threadId.map(knownThreads.contains) == true
+                return isInLoadedRange && !isThreadListed
+            }
 
             // Grouped, a row stands for a whole conversation: a reply arriving
             // in one already listed replaces that row rather than opening a
@@ -2693,7 +2848,12 @@ final class MailStore: ObservableObject {
                 emails.removeAll { $0.threadId.map(arrivingThreads.contains) ?? false }
             }
 
-            emails.insert(contentsOf: additions, at: 0)
+            // New mail is newest and lands on top; something moved in lands at
+            // its own date. The sort is stable, so the server's order holds
+            // for everything already there.
+            if !additions.isEmpty {
+                emails = (additions + emails).sorted { ($0.receivedAt ?? .distantPast) > ($1.receivedAt ?? .distantPast) }
+            }
         }
 
         // Reopen whatever the user had open, with the new messages in it.

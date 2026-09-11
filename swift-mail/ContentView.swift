@@ -33,6 +33,7 @@ private struct MailHomeView: View {
     @Environment(\.openWindow) private var openWindow
     /// The message a forward is being started for, while the format is chosen.
     @State private var forwarding: EmailDetail?
+    @AppStorage(SnoozePreferences.presetsKey) private var snoozePresetData: Data?
 
     var body: some View {
         NavigationSplitView {
@@ -82,6 +83,16 @@ private struct MailHomeView: View {
         } message: { _ in
             Text("Markdown is easier to edit but flattens the original message: its layout, styling and inline images are lost. Keeping the original formatting sends its HTML untouched, with your own note above it. Either way, attachments come along.")
         }
+        .sheet(isPresented: Binding(
+            get: { store.customSnoozeEmailID != nil },
+            set: { if !$0 { store.customSnoozeEmailID = nil } }
+        )) {
+            CustomSnoozeSheet { date in
+                if let emailID = store.customSnoozeEmailID {
+                    Task { await store.snooze(emailID: emailID, until: date) }
+                }
+            }
+        }
         .alert("Mail Error", isPresented: Binding(
             get: { store.errorMessage != nil },
             set: { if !$0 { store.errorMessage = nil } }
@@ -130,6 +141,37 @@ private struct MailHomeView: View {
             .help("Flag")
             .tint(.orange)
             .disabled(store.selectedEmail == nil || store.updatingFlagEmailIDs.contains(store.selectedEmail?.id ?? ""))
+
+            // A split button, like Spam: the label half snoozes to the first
+            // preset still ahead in one click, the chevron half holds the rest
+            // and a time of your own. Last in its group for the same reason
+            // Spam is — a split button gets a capsule of its own.
+            Menu {
+                if let email = store.selectedEmail {
+                    SnoozeMenuItems(store: store, emailID: email.id)
+                }
+            } label: {
+                Label("Snooze", systemImage: "moon.zzz")
+                    .symbolEffect(.bounce, value: store.snoozedEmails.count)
+            } primaryAction: {
+                guard let email = store.selectedEmail else {
+                    return
+                }
+
+                // With every preset gone or already past, the one click still
+                // does something useful rather than nothing.
+                if let date = firstSnoozePreset?.date(from: .now) {
+                    Task { await store.snooze(emailID: email.id, until: date) }
+                } else {
+                    store.customSnoozeEmailID = email.id
+                }
+            }
+            .help(snoozeHelp)
+            .disabled(
+                store.selectedEmail == nil
+                    || !store.supportsSnooze
+                    || store.movingEmailIDs.contains(store.selectedEmail?.id ?? "")
+            )
         }
 
         ToolbarSpacer(.fixed)
@@ -273,6 +315,18 @@ private struct MailHomeView: View {
             }
             .help("Account")
         }
+    }
+
+    private var firstSnoozePreset: SnoozePreset? {
+        SnoozePreferences.presets(from: snoozePresetData).first { $0.date(from: .now) != nil }
+    }
+
+    private var snoozeHelp: String {
+        guard store.supportsSnooze else {
+            return "Snooze isn't available for this account"
+        }
+
+        return firstSnoozePreset.map { "Snooze — \($0.label())" } ?? "Snooze"
     }
 
     private func reportSpam(isPhishing: Bool) {
