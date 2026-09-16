@@ -38,10 +38,31 @@ jobs:
       - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          # Bump this to a specific version (e.g. "16.4") if the runner's
-          # "latest-stable" doesn't yet ship the SDK this project targets
-          # (currently macOS 26.5 — see MACOSX_DEPLOYMENT_TARGET).
-          xcode-version: latest-stable
+          # macOS gates its newer control metrics on the SDK a binary is LINKED
+          # against, not on the OS it runs on — so an app built against the 26.5
+          # SDK keeps 26-era toolbar sizing even on macOS 27, which is what made
+          # the dropdown toolbar icons look wrong there. Xcode 27 ships on the
+          # runner image as a *preview*, and `latest-stable` skips previews, so
+          # it quietly resolved to Xcode 26 and shipped a 26.5-SDK build.
+          #
+          # Pinned to the major version: minor updates come along, a major one
+          # is a deliberate choice. This is only the SDK we compile against —
+          # MACOSX_DEPLOYMENT_TARGET stays 26.5, so macOS 26 is still supported.
+          xcode-version: '27'
+
+      - name: Verify SDK
+        # The failure this guards against is invisible: linking against an older
+        # SDK still builds and still runs, it just silently reverts the toolbar
+        # rendering. Cheaper to fail here than to notice it in a release.
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk macosx --show-sdk-version)
+          echo "Xcode: $(xcodebuild -version | head -1)"
+          echo "macOS SDK: $SDK"
+          if [ "${SDK%%.*}" -lt 27 ]; then
+            echo "::error::Expected macOS SDK 27 or newer, got $SDK — toolbar rendering will regress on macOS 27."
+            exit 1
+          fi
 
       - name: Build
         run: |
