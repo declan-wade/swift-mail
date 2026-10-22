@@ -5,6 +5,7 @@ struct EmailListView: View {
     @ObservedObject var store: MailStore
     @Environment(\.openWindow) private var openWindow
     @State private var isSweeping = false
+    @FocusState private var isListFocused: Bool
     /// `NavigationSplitView` doesn't remember a dragged column width, so the
     /// last width is saved and fed back as the ideal on the next launch. Read
     /// once: changing `ideal` while the user drags would fight the divider.
@@ -182,27 +183,68 @@ struct EmailListView: View {
         }
     }
 
-    private var messageList: some View {
-        List(selection: $store.selectedEmailID) {
-            ForEach(store.emails) { email in
-                EmailRow(email: email, store: store)
-                    .tag(email.id)
-                    .contextMenu { menu(for: email) }
+    /// Every selectable row in display order: each message followed by the
+    /// rest of its conversation when that is open.
+    private var visibleEmailIDs: [EmailPreview.ID] {
+        store.emails.flatMap { email in
+            [email.id] + store.expandedMessages(for: email).map(\.id)
+        }
+    }
 
-                // The rest of an opened conversation, oldest first, indented
-                // under the row that stands for it. Each is a real message with
-                // its own selection tag, so opening one reads it as usual.
-                ForEach(store.expandedMessages(for: email)) { message in
-                    EmailRow(email: message, store: store, isThreadChild: true)
-                        .tag(message.id)
-                        .contextMenu { menu(for: message) }
+    private var messageList: some View {
+        ScrollViewReader { proxy in
+            List(selection: $store.selectedEmailID) {
+                ForEach(store.emails) { email in
+                    EmailRow(email: email, store: store)
+                        .tag(email.id)
+                        .contextMenu { menu(for: email) }
+
+                    // The rest of an opened conversation, oldest first, indented
+                    // under the row that stands for it. Each is a real message with
+                    // its own selection tag, so opening one reads it as usual.
+                    ForEach(store.expandedMessages(for: email)) { message in
+                        EmailRow(email: message, store: store, isThreadChild: true)
+                            .tag(message.id)
+                            .contextMenu { menu(for: message) }
+                    }
+                }
+
+                if store.hasMoreEmails {
+                    loadMoreRow
                 }
             }
+            .focused($isListFocused)
+            .onAppear { isListFocused = true }
+            .onKeyPress(keys: [.upArrow, .downArrow], phases: [.down, .repeat]) { press in
+                guard press.modifiers.isEmpty else {
+                    return .ignored
+                }
 
-            if store.hasMoreEmails {
-                loadMoreRow
+                return moveSelection(by: press.key == .upArrow ? -1 : 1, proxy: proxy)
             }
         }
+    }
+
+    /// Steps the selection one row, stopping at either end. Handled here rather
+    /// than left to the table so it behaves the same whichever view last had
+    /// focus, and so held keys keep scrolling the new row into view.
+    private func moveSelection(by offset: Int, proxy: ScrollViewProxy) -> KeyPress.Result {
+        let ids = visibleEmailIDs
+
+        guard !ids.isEmpty else {
+            return .ignored
+        }
+
+        let target: EmailPreview.ID
+        if let current = store.selectedEmailID, let index = ids.firstIndex(of: current) {
+            target = ids[min(max(index + offset, 0), ids.count - 1)]
+        } else {
+            target = offset < 0 ? ids[ids.count - 1] : ids[0]
+        }
+
+        store.selectedEmailID = target
+        proxy.scrollTo(target)
+        return .handled
     }
 
     @ViewBuilder
