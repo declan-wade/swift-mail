@@ -43,6 +43,13 @@ struct SweepView: View {
         .frame(width: 580, height: 600)
         .onAppear {
             destinationID = store.mailbox(role: "archive")?.id
+
+            // Start from the selected message's sender — the common case is
+            // "clear out everything from whoever sent this".
+            if let selectedID = store.selectedEmailID,
+               let sender = store.emails.first(where: { $0.id == selectedID })?.from?.first?.email {
+                query = "from:\(sender)"
+            }
         }
         .onDisappear { previewTask?.cancel() }
     }
