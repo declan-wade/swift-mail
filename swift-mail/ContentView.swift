@@ -289,24 +289,15 @@ private struct MailHomeView: View {
         ToolbarSpacer(.fixed)
 
         ToolbarItemGroup {
-            Button {
-                openWindow(id: MaskedEmailWindow.id)
-            } label: {
-                // The badge and shield hang below the envelope, so this glyph's
-                // ink sits above the centre of its own box — measured at 1.5px
-                // against 0.5px for person.crop.circle beside it — and it rides
-                // visibly high. Optical alignment, so it's a nudge rather than
-                // a layout rule.
-                Label {
-                    Text("Masked Email")
-                } icon: {
-                    Image(systemName: "envelope.badge.shield.half.filled")
-                        .offset(y: 1)
-                }
-            }
-            .help("Masked Email (⇧⌘M)")
-
             Menu {
+                Button {
+                    openWindow(id: MaskedEmailWindow.id)
+                } label: {
+                    Label("Masked Email\u{2026}", systemImage: "envelope.badge.shield.half.filled")
+                }
+
+                Divider()
+
                 Button("Remove Account", role: .destructive) {
                     store.removeAccount()
                 }
