@@ -5,6 +5,15 @@ struct EmailListView: View {
     @ObservedObject var store: MailStore
     @Environment(\.openWindow) private var openWindow
     @State private var isSweeping = false
+    /// `NavigationSplitView` doesn't remember a dragged column width, so the
+    /// last width is saved and fed back as the ideal on the next launch. Read
+    /// once: changing `ideal` while the user drags would fight the divider.
+    @State private var idealWidth: Double = {
+        let saved = UserDefaults.standard.double(forKey: EmailListView.widthKey)
+        return saved >= Theme.Column.list.min ? saved : Theme.Column.list.ideal
+    }()
+
+    private static let widthKey = "emailListColumnWidth"
 
     private var searchBinding: Binding<String> {
         Binding(
@@ -16,7 +25,12 @@ struct EmailListView: View {
     var body: some View {
         content
             .navigationTitle(store.selectedMailbox?.displayName ?? "Inbox")
-            .navigationSplitViewColumnWidth(min: Theme.Column.list.min, ideal: Theme.Column.list.ideal)
+            .navigationSplitViewColumnWidth(min: Theme.Column.list.min, ideal: idealWidth)
+            .onGeometryChange(for: Double.self) { $0.size.width } action: { width in
+                // A collapsed column reports a tiny width; don't save that.
+                guard width >= Theme.Column.list.min else { return }
+                UserDefaults.standard.set(width, forKey: Self.widthKey)
+            }
             .toolbar { listToolbar }
             .sheet(isPresented: $isSweeping) {
                 SweepView(store: store)
